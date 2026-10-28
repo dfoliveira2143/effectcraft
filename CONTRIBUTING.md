@@ -1,5 +1,9 @@
 # Contributing to EffectCraft
 
+## Politica de validacao local
+
+Siga a politica obrigatoria de [validacao documental e confirmacao para testes](AGENTS.md#validacao-documental-e-confirmacao-para-testes). Commits exclusivamente documentais elegiveis usam revisao do diff, `git diff --check`, conferencia de links locais e coerencia das instrucoes; informe a dispensa da validacao completa. Testes, compilacao, lint de codigo e CI exigem explicacao previa de necessidade e alcance e confirmacao explicita do usuario antes de executar. Comandos e rotinas abaixo estao sujeitos a essa politica, inclusive verificacoes iniciais; autonomia nao dispensa essa confirmacao.
+
 Thanks for helping. Please read [AGENTS.md](AGENTS.md) first: its rules on assets and clean-room
 work apply to everyone, people and AI agents alike, and they are not negotiable.
 
@@ -28,7 +32,7 @@ cargo xtask ci                           # what every commit must pass
   `panic!`, `unreachable!`, `todo!`, `unimplemented!` or `unsafe`, checked indexing and arithmetic on
   input-derived values, and a regression test with every crash fix. See the "Never crash" section of
   [AGENTS.md](AGENTS.md).
-- **Tests with every change**, and green `cargo xtask ci` before every commit. One task per commit.
+- **Tests with changes requiring code validation**, and green `cargo xtask ci` before commits requiring code validation (subject to the documentation exception and explicit user confirmation in AGENTS.md). One task per commit.
 
 ## How to add…
 

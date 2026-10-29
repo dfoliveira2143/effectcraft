@@ -1,17 +1,4 @@
-<p align="center">
-
-## Politica de validacao local
-
-Siga a politica obrigatoria de [validacao documental e confirmacao para testes](AGENTS.md#validacao-documental-e-confirmacao-para-testes). Commits exclusivamente documentais elegiveis usam revisao do diff, `git diff --check`, conferencia de links locais e coerencia das instrucoes; informe a dispensa da validacao completa. Testes, compilacao, lint de codigo e CI exigem explicacao previa de necessidade e alcance e confirmacao explicita do usuario antes de executar. Comandos e rotinas abaixo estao sujeitos a essa politica, inclusive verificacoes iniciais; autonomia nao dispensa essa confirmacao.
-
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
-
+> **Creative Workshop — independent edition.** Based on effectcraft by the ArtCraft team and contributors. Not affiliated with, endorsed by, or supported by ArtCraft. [Origin and branding policy](docs/branding.md).
 
 <p align="center">
   <img src="assets/app-icon/hicolor/256x256/apps/ai.storyteller.effectcraft.png" width="128" height="128" alt="EffectCraft icon: an engraved unicorn on a pink tile">
@@ -34,18 +21,13 @@ Siga a politica obrigatoria de [validacao documental e confirmacao para testes](
   <img alt="Written in Rust" src="https://img.shields.io/badge/rust-1.95%2B-b0206c?style=flat-square&logo=rust&logoColor=white">
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-555?style=flat-square">
   <br>
-  <a href="https://sonarcloud.io/project/overview?id=storytold_effectcraft"><img alt="Scanned by SonarCloud" src="https://img.shields.io/badge/Scanned_by-SonarCloud-4b9fd5?style=flat-square&logo=sonarqubecloud&logoColor=white"></a>
-  <a href="https://coderabbit.ai"><img alt="Reviewed by CodeRabbit" src="https://img.shields.io/coderabbit/prs/github/storytold/effectcraft?style=flat-square&label=Reviewed%20by%20CodeRabbit&logo=coderabbit"></a>
 </p>
 
-<p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
 
 <p align="center">
-  <a href="https://getartcraft.com/apps/effectcraft"><b>EffectCraft on getartcraft.com</b></a> ·
-  <a href="https://getartcraft.com/">ArtCraft</a> ·
-  <a href="https://getartcraft.com/apps">All Crafting Apps</a>
+  <a href="https://github.com/dfoliveira2143/effectcraft"><b>EffectCraft on github.com/dfoliveira2143</b></a> ·
+  <a href="https://github.com/dfoliveira2143">Creative Workshop</a> ·
+  <a href="https://github.com/dfoliveira2143">All Crafting Apps</a>
 </p>
 
 <br>
@@ -54,9 +36,6 @@ Siga a politica obrigatoria de [validacao documental e confirmacao para testes](
   <img src="docs/images/effectcraft-hero.png" alt="EffectCraft's main window: the animated demo composition in the Composition panel, the Project panel, a Timeline with text, shape and solid layers, and the Properties panel showing the selected text layer's transform, font and paragraph settings" width="100%">
 </p>
 
-> [!NOTE]
-> **ArtCraft is a community of artists from all walks of life.** Digital, generative, music,
-> games &mdash; if you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
 
 <p align="center">
   <a href="#what-effectcraft-is">What it is</a> ·
@@ -195,7 +174,7 @@ See [docs/agents.md](docs/agents.md) and [docs/control-protocol.md](docs/control
 
 ## Get started
 
-Installers for each version are on the [Releases](https://github.com/storytold/effectcraft/releases)
+Installers for each version are on the [Releases](https://github.com/dfoliveira2143/effectcraft/releases)
 page: a universal macOS app; Windows MSIs and portable zips for x64, x86 and ARM64; Linux
 AppImage, Flatpak, deb, rpm and tar.gz for x86_64 and aarch64, plus a riscv64 tar.gz; a FreeBSD x86_64 tarball; and the
 web build. [Downloads](#downloads) lists every file. The Windows ARM64 build runs natively on
@@ -216,7 +195,7 @@ emerge --ask media-video/effectcraft-bin
 To build it yourself you need [Rust](https://rustup.rs/) 1.95 or newer.
 
 ```sh
-git clone https://github.com/storytold/effectcraft
+git clone https://github.com/dfoliveira2143/effectcraft
 cd effectcraft
 cargo run --release -p effectcraft          # the app (add `-- --demo` to open the demo project)
 cargo run --release -p effectcraft-cli -- render --out intro.mp4    # render the demo headless
@@ -252,7 +231,7 @@ EffectCraft is in **alpha**: about 91% of the features tracked in
 way to being ready for full professional production work. The [ROADMAP](ROADMAP.md) has the plan,
 [docs/target-app-parity.md](docs/target-app-parity.md) the measurement and [docs/gaps.md](docs/gaps.md)
 every known shortfall. The web build ([docs/web.md](docs/web.md)) runs the full app in the browser.
-[Bug reports](https://github.com/storytold/effectcraft/issues) are the most useful thing you can
+[Bug reports](https://github.com/dfoliveira2143/effectcraft/issues) are the most useful thing you can
 send us right now.
 
 ## How it's made
@@ -268,9 +247,11 @@ send us right now.
 
 ## Downloads
 
-**New to EffectCraft?** Download it from the [EffectCraft page on getartcraft.com](https://getartcraft.com/apps/effectcraft). That's the easiest way to install it.
+Creative Workshop packages have not yet been rebuilt or validated. The inherited platform instructions below describe packaging capabilities, not a guarantee that a release is available or signed.
 
-**Want a specific build or format?** On GitHub, the [latest release](https://github.com/storytold/effectcraft/releases/latest) has every build listed below, and [all releases](https://github.com/storytold/effectcraft/releases) has earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
+**New to EffectCraft?** Download it from the [EffectCraft page on github.com/dfoliveira2143](https://github.com/dfoliveira2143/effectcraft). That's the easiest way to install it.
+
+**Want a specific build or format?** On GitHub, the [latest release](https://github.com/dfoliveira2143/effectcraft/releases/latest) has every build listed below, and [all releases](https://github.com/dfoliveira2143/effectcraft/releases) has earlier versions and their notes. `<ver>` in the file names is the version number, and `SHA256SUMS.txt` lists a checksum for every file.
 
 ### Windows
 
@@ -281,8 +262,8 @@ send us right now.
 | x86 (32-bit) | `effectcraft-<ver>-windows-x86.msi` | `effectcraft-<ver>-windows-x86-portable.zip` |
 
 Installers and executables are code-signed. The installer asks who to install EffectCraft for and where. By default it installs for your
-account only, into `%LOCALAPPDATA%\Programs\ArtCraft\EffectCraft`, without an administrator prompt;
-"Everyone on this computer" installs into `C:\Program Files\ArtCraft\EffectCraft` (`Program Files (x86)` for the 32-bit build). Later versions
+account only, into `%LOCALAPPDATA%\Programs\Creative Workshop\EffectCraft`, without an administrator prompt;
+"Everyone on this computer" installs into `C:\Program Files\Creative Workshop\EffectCraft` (`Program Files (x86)` for the 32-bit build). Later versions
 install into the same folder. To install silently
 into a folder of your choice: `msiexec /i effectcraft-<ver>-windows-x64.msi /qn INSTALLFOLDER="D:\Apps\EffectCraft"`.
 A silent install is per-user by default. `INSTALLFOLDER` chooses the folder, not who it is installed for;
@@ -335,43 +316,7 @@ File ▸ Import fallback instead.
 
 ## The Crafting Apps
 
-EffectCraft is one of the **Crafting Apps**: free, open-source creative tools from the
-[ArtCraft](https://getartcraft.com/) team, each written from scratch in Rust and each able to
-stand on its own.
-
-| | App | What it's for | Code | Learn more |
-|:-:|---|---|---|---|
-| <img src="https://raw.githubusercontent.com/storytold/photocraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.photocraft.png" alt="" width="32" height="32"> | **PhotoCraft** | Image editing: layers, masks, type and real PSD files | [GitHub](https://github.com/storytold/photocraft) | [Website](https://getartcraft.com/apps/photocraft) |
-| <img src="https://raw.githubusercontent.com/storytold/vectorcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.vectorcraft.png" alt="" width="32" height="32"> | **VectorCraft** | Vector illustration | [GitHub](https://github.com/storytold/vectorcraft) | [Website](https://getartcraft.com/apps/vectorcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/filmcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.filmcraft.png" alt="" width="32" height="32"> | **FilmCraft** | Video editing, color and sound | [GitHub](https://github.com/storytold/filmcraft) | [Website](https://getartcraft.com/apps/filmcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/lightcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.lightcraft.png" alt="" width="32" height="32"> | **LightCraft** | Photo library and raw development | [GitHub](https://github.com/storytold/lightcraft) | [Website](https://getartcraft.com/apps/lightcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | **Motion graphics and visual effects · you are here** | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
-
-And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video studio for artists who want real control.
-
-<br>
-
-<p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
-
-<h3 align="center">Come make things with us</h3>
-
-<p align="center">
-  Our Discord is where artists of every kind hang out: people who paint, shoot, draw, cut film,
-  set type, and people still figuring out what they like to make. Share what you're working on,
-  ask for help, tell us what's broken, or tell us what you wish these tools could do.
-  Whatever your medium and however long you've been at it, you're welcome here.
-</p>
-
-<p align="center">
-  <a href="https://discord.gg/artcraft"><b>discord.gg/artcraft</b></a> ·
-  <a href="https://getartcraft.com/">getartcraft.com</a> ·
-  <a href="https://getartcraft.com/apps">The Crafting Apps</a> ·
-  <a href="https://getartcraft.com/apps/effectcraft">EffectCraft</a>
-</p>
+This independent edition belongs to **Creative Workshop**. It is not an official ArtCraft product.
 
 ## License and credits
 
@@ -381,19 +326,8 @@ Copyright (c) 2026 ArtCraft Team and the EffectCraft contributors. Required noti
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and EffectCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The restricted ArtCraft brand assets are excluded from this edition. Original trademark terms remain in [docs/brand/LICENSE-brand.txt](docs/brand/LICENSE-brand.txt); see [branding policy](docs/branding.md).
 
-<p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
-</p>
-
-## Star history
-
-[![Star History Chart](https://api.star-history.com/svg?repos=storytold/effectcraft&type=Date&legend=top-left)](https://www.star-history.com/?repos=storytold%2Feffectcraft&type=date&legend=top-left)
 
 ## Documentação para agentes
 

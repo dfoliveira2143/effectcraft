@@ -45,3 +45,5 @@ Os guias são mapas de navegação, não novas cópias dos contratos técnicos. 
 - [Testing](testing.md)
 - [UI parity](ui-parity.md)
 - [EffectCraft on the web](web.md)
+
+- [Creative Workshop: origem, identidade e publicação](branding.md)

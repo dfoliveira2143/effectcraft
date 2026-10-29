@@ -11,7 +11,7 @@
     3. upgrades to 0.0.3 the same way (found from the Path value 0.0.2 wrote),
     4. repairs a damaged (unversioned) CLI there with the wizard's Repair mode,
     5. uninstalls: files, the App Paths registration and the desktop shortcut go,
-    6. installs 0.0.3 with no folder and DESKTOPSHORTCUT=0: it must land in Program Files\ArtCraft\EffectCraft (ALLUSERS=1) with no
+    6. installs 0.0.3 with no folder and DESKTOPSHORTCUT=0: it must land in Program Files\Creative Workshop\EffectCraft (ALLUSERS=1) with no
        desktop shortcut, then uninstalls.
   The installs before step 6 take the default desktop shortcut, which upgrades keep.
   The wizard itself needs a person (or the snapshot steps in the PR); this covers what msiexec /qn
@@ -95,7 +95,7 @@ foreach ($v in '0.0.1', '0.0.2', '0.0.3') {
 
 # Spaces and a non-ASCII letter (written as a char so the script's own encoding doesn't matter).
 $Custom = Join-Path $env:SystemDrive "EffectCraft Test $([char]0x00DC)nicode\My Apps"
-$Default = Join-Path $env:ProgramFiles 'ArtCraft\EffectCraft'
+$Default = Join-Path $env:ProgramFiles 'Creative Workshop\EffectCraft'
 if (Test-Path -LiteralPath $AppPaths) { throw 'EffectCraft is already installed here; run this on a clean machine' }
 
 Invoke-Msiexec 'install the legacy package to a custom folder' @('/i', "`"$($Msi['0.0.1'])`"", "INSTALLFOLDER=`"$Custom`"")

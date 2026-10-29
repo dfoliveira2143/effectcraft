@@ -3,11 +3,11 @@
 
 pub const APP_NAME: &str = "EffectCraft";
 pub const APP_SLUG: &str = "effectcraft";
-pub const DISCORD: &str = "https://discord.gg/artcraft";
-pub const WEBSITE: &str = "https://getartcraft.com";
-pub const APP_PAGE: &str = "https://getartcraft.com/apps/effectcraft";
-pub const GITHUB: &str = "https://github.com/storytold/effectcraft";
-pub const ISSUES: &str = "https://github.com/storytold/effectcraft/issues";
+pub const DISCORD: &str = "https://github.com/dfoliveira2143/effectcraft/issues";
+pub const WEBSITE: &str = "https://github.com/dfoliveira2143";
+pub const APP_PAGE: &str = "https://github.com/dfoliveira2143/effectcraft";
+pub const GITHUB: &str = "https://github.com/dfoliveira2143/effectcraft";
+pub const ISSUES: &str = "https://github.com/dfoliveira2143/effectcraft/issues";
 
 /// Sibling apps of the ArtCraft family: (name, what it is, GitHub repo, app page).
 pub const SIBLINGS: &[(&str, &str)] = &[
@@ -20,8 +20,8 @@ pub const SIBLINGS: &[(&str, &str)] = &[
 ];
 
 pub fn github_of(slug: &str) -> String {
-    format!("https://github.com/storytold/{slug}")
+    format!("https://github.com/dfoliveira2143/{slug}")
 }
 pub fn page_of(slug: &str) -> String {
-    format!("https://getartcraft.com/apps/{slug}")
+    format!("https://github.com/dfoliveira2143/{slug}")
 }

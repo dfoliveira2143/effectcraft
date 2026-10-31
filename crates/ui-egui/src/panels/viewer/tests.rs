@@ -139,3 +139,26 @@ fn gizmo_segments_clip_at_the_near_plane() {
     assert!(s[1][0] > 10.0 && s[1][0].is_finite(), "toward the camera it grows, never flips: {s:?}");
     assert!(project_segment(&pc, vec3(0.0, 0.0, -200.0), vec3(0.0, 0.0, -300.0)).is_none());
 }
+
+/// #999: a vertex drag pans the view only near or past the edge, toward it, faster further out.
+#[test]
+fn edge_pan_speed_moves_toward_the_edge() {
+    let area = Rect::from_min_max(pos2(100.0, 50.0), pos2(900.0, 650.0));
+    assert_eq!(edge_pan_speed(area, pos2(500.0, 350.0)), egui::Vec2::ZERO);
+    let left = edge_pan_speed(area, pos2(105.0, 350.0));
+    assert!(left.x > 0.0 && left.y == 0.0, "near the left edge the view moves right to show more: {left:?}");
+    assert!(edge_pan_speed(area, pos2(20.0, 350.0)).x > left.x, "faster past the edge");
+    let corner = edge_pan_speed(area, pos2(950.0, 700.0));
+    assert!(corner.x < 0.0 && corner.y < 0.0, "{corner:?}");
+}
+
+/// Every 3D view names its own `view.3d.*` command: a typo in that mapping would fall back to the
+/// English label silently, which is what the viewer showed before (#2691).
+#[test]
+fn every_3d_view_finds_its_japanese_row() {
+    crate::i18n::ui::set_current("ja");
+    for v in View3D::ALL {
+        assert_ne!(view3d_label(v), v.label(), "{v:?} has no Japanese row");
+    }
+    crate::i18n::ui::set_current("en");
+}

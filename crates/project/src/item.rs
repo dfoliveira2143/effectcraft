@@ -2,7 +2,7 @@ use super::comp::Comp;
 use super::footage::{Footage, FootageKind, Proxy, Solid};
 use super::layer::LayerSource;
 use super::settings::{APP_VERSION, ProjectError, ProjectSettings, SCHEMA_VERSION, SavedView};
-use super::*;
+use super::{Arc, BTreeMap, Deserialize, FrameRate, Label, Project, Serialize, Tick, file_check, limits};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ItemId(pub u64);
@@ -98,6 +98,21 @@ impl Default for Project {
 }
 
 impl Project {
+    /// Some layer has an expression, which can read markers (`marker.key(1)`, `numKeys`,
+    /// `nearestKey`...). Only then do the markers of comps and layers affect what is rendered, so
+    /// frame caches ignore them otherwise.
+    pub fn reads_markers(&self) -> bool {
+        // Called for every frame identity and disk-cache key: stops at the first expression and
+        // builds no paths (`PropGroup::walk` formats one per node).
+        fn any_expr(g: &crate::PropGroup) -> bool {
+            g.children.iter().any(|c| match c {
+                crate::Node::Prop(p) => p.expr.is_some(),
+                crate::Node::Group(sub) => any_expr(sub),
+            })
+        }
+        self.comps().any(|(_, c)| c.layers.iter().any(|l| any_expr(&l.props)))
+    }
+
     /// Allocate an id (items, layers and property uids share one counter).
     pub fn alloc(&mut self) -> u64 {
         let id = self.next_id;
@@ -252,29 +267,18 @@ impl Project {
     /// (NaN or infinity, written as `null`, and nesting too deep to parse) are refused on every
     /// save; debug builds also read the text back.
     pub fn to_file_json(&self) -> Result<String, ProjectError> {
-        self.to_file_json_with_view(&SavedView::default())
+        self.to_file_json_with_view(&SavedView::default(), false)
     }
-    /// [`Project::to_file_json`] that also records the open compositions ([`SavedView`]).
-    pub fn to_file_json_with_view(&self, view: &SavedView) -> Result<String, ProjectError> {
-        if self.schema > SCHEMA_VERSION {
-            return Err(ProjectError::Invalid(format!(
-                "the project can't be saved: it holds a value a project file can't store (project schema {} is newer than this version supports ({SCHEMA_VERSION}))",
-                self.schema
-            )));
-        }
-        #[derive(Serialize)]
-        struct File<'a> {
-            #[serde(rename = "savedBy")]
-            saved_by: &'a str,
-            #[serde(flatten)]
-            view: &'a SavedView,
-            #[serde(flatten)]
-            project: &'a Project,
-        }
-        let file = File { saved_by: APP_VERSION, view, project: self };
+    /// [`Project::to_file_json`] that also records the open compositions ([`SavedView`]), on one
+    /// line when `compact` (Settings ▸ Project ▸ Save Compact Project Files).
+    pub fn to_file_json_with_view(&self, view: &SavedView, compact: bool) -> Result<String, ProjectError> {
+        craft_ecproj_format::check_schema(self.schema)
+            .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: it holds a value a project file can't store ({e})")))?;
+        let file = craft_ecproj_format::File::new(APP_VERSION, view, self);
         file_check::check(&file)
             .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: it holds a value a project file can't store ({e})")))?;
-        let text = serde_json::to_string_pretty(&file).map_err(|e| ProjectError::Invalid(format!("the project can't be saved: {e}")))?;
+        let text =
+            if compact { file.to_json_compact() } else { file.to_json() }.map_err(|e| ProjectError::Invalid(format!("the project can't be saved: {e}")))?;
         #[cfg(debug_assertions)]
         Project::from_json(&text)
             .map_err(|e| ProjectError::Invalid(format!("the project can't be saved: it holds a value a project file can't store ({e})")))?;
@@ -295,9 +299,7 @@ impl Project {
     /// hostile file still opens, within bounds, and the user can be told what changed.
     pub fn from_json_repaired(s: &str) -> Result<(Project, Vec<String>), ProjectError> {
         let mut p: Project = serde_json::from_str(s).map_err(|e| ProjectError::Invalid(e.to_string()))?;
-        if p.schema > SCHEMA_VERSION {
-            return Err(ProjectError::Invalid(format!("project schema {} is newer than this version supports ({SCHEMA_VERSION})", p.schema)));
-        }
+        craft_ecproj_format::check_schema(p.schema).map_err(|e| ProjectError::Invalid(e.to_string()))?;
         p.fix_next_id();
         let mut notes = vec![];
         for item in p.items.values_mut() {

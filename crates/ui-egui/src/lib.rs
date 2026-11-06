@@ -7,12 +7,24 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub(crate) mod a11y;
+
+/// EffectCraft as craft-update knows it, with its 128 px icon and accent colour: the update
+/// prompt shows both, and an AppImage's menu entry gets the icon.
+#[cfg(not(target_arch = "wasm32"))]
+pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
+    icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.effectcraft.png")),
+    accent: Some([0xe0, 0x36, 0x8f]),
+    ..craft_update::suite::EFFECTCRAFT
+};
+
 pub mod audio;
 pub mod automation;
 pub mod bench;
 pub mod color_picker;
 pub mod control;
 pub mod credits;
+pub mod display_gpu;
 pub mod dock;
 pub mod dock_ui;
 mod expression_diagnostics;
@@ -51,6 +63,7 @@ mod app;
 mod clock;
 mod hooks;
 
+pub use app::{GPU_PREPARING, GpuBuild};
 #[cfg(test)]
 use app::{MAX_PENDING_SHOTS, SCREENSHOT_SETTLE_PASSES, SCREENSHOT_SETTLE_S, SCREENSHOT_TIMEOUT_S};
 pub use clock::AppClock;
@@ -140,6 +153,9 @@ pub enum Dialog {
     UnsavedChanges,
     /// Delete Project items that compositions use? (`panels::delete_items`).
     DeleteItems,
+    /// Import an After Effects project although some of it cannot be imported exactly?
+    /// (`panels::aep_losses`).
+    AepLosses,
     /// A gradient property's Gradient Editor (`panels::gradient_editor`, `prop.editGradient`).
     GradientEditor,
     /// Delete a user template from Home? (`panels::templates`).
@@ -184,6 +200,17 @@ pub struct Playback {
     /// fits in the RAM preview) is cached, so it never plays over skipped frames (#103), or
     /// sooner once the silent preview keeps real time with the frames ahead cached (#208).
     pub audio_held: bool,
+    /// Starting a preview with sound (#947): the playhead stays on the first frame while the
+    /// frames ahead render (the prefetch window, at most what fits in the RAM preview), then
+    /// sound and picture start together from it. Without this the picture played on silently
+    /// while they rendered and the sound started at the later frame, so the opening was lost.
+    /// A stall later on still falls back to [`Playback::audio_held`].
+    pub starting: bool,
+    /// When the preview started (seconds): [`Playback::starting`] gives up after `STARTUP_LIMIT`.
+    pub starting_since: f64,
+    /// When the first frame was cached while [`Playback::starting`] (seconds): the wait for the
+    /// frames ahead gives up `STARTUP_WAIT` after it.
+    pub first_cached: Option<f64>,
     /// When the last frames were shown (seconds, the last second's worth): the achieved rate.
     pub shown_at: std::collections::VecDeque<f64>,
 }
@@ -288,10 +315,28 @@ pub struct EffectcraftApp {
     /// The last GPU frame shown: its egui texture id (registered with egui-wgpu), key and texture.
     pub(crate) viewer_native: Option<(egui::TextureId, FrameKey, Arc<effectcraft_gpu::DisplayFrame>)>,
     /// The texture the viewer draws and its frame key (CPU or GPU frame).
-    pub(crate) viewer_shown: Option<(egui::TextureId, FrameKey)>,
-    /// Last displayed image (Info panel colour, eyedroppers, histograms). GPU frames fill it on
-    /// demand ([`EffectcraftApp::viewer_pixels`]).
+    /// (`None` texture: a half-float frame, drawn by the display pass.)
+    pub(crate) viewer_shown: Option<(Option<egui::TextureId>, FrameKey)>,
+    /// A Cryptomatte eyedropper probe is being built (one at a time, re-arming included).
+    pub(crate) crypto_probe_busy: Arc<std::sync::atomic::AtomicBool>,
+    /// Last displayed image (Info panel colour, eyedroppers, histograms). GPU frames and
+    /// half-float frames fill it on demand ([`EffectcraftApp::viewer_pixels`]).
     pub(crate) viewer_image: Option<Arc<egui::ColorImage>>,
+    /// The half-float frame on screen (32 bpc projects; its key is `viewer_shown`'s).
+    pub(crate) viewer_f16: Option<Arc<frames::F16Frame>>,
+    /// The window's egui-wgpu device (with or without a GPU compositor on it): the display pass
+    /// runs there.
+    pub(crate) window_wgpu: Option<eframe::egui_wgpu::RenderState>,
+    /// The display pass on that device (made with the first frame that needs it), and whether
+    /// making it failed (the pass then runs on the CPU).
+    pub(crate) display_gpu: Option<Arc<display_gpu::DisplayGpu>>,
+    pub(crate) display_gpu_failed: bool,
+    /// The Composition viewer's and the snapshot's displayed textures (display pass).
+    pub(crate) viewer_bake: display_gpu::Bake,
+    pub(crate) snapshot_bake: display_gpu::Bake,
+    /// The snapshot in half floats for the display pass (the image it was made from, not kept
+    /// alive by this).
+    pub(crate) snapshot_f16: Option<(std::sync::Weak<effectcraft_engine::render::Image>, Arc<frames::F16Frame>)>,
     /// wasm32: an asynchronous readback of a GPU viewer frame (key asked for, result).
     viewer_readback: (Option<FrameKey>, Arc<std::sync::Mutex<Option<(FrameKey, Arc<egui::ColorImage>)>>>),
     /// egui-wgpu's device, once the first frame arrives (desktop and WebGPU).
@@ -299,8 +344,17 @@ pub struct EffectcraftApp {
     /// The GPU compositor on that device (None: no usable adapter → CPU only).
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
     gpu_checked: bool,
+    /// The GPU compositor being built on a worker thread (desktop): the window opens at once and
+    /// composites on the CPU until the worker's result lands ([`Self::init_gpu`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu_build: Option<Receiver<GpuBuild>>,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
+    /// Settings ▸ Import ▸ Reload Footage Changed on Disk: the worker that stamps the footage
+    /// files, started with the first project that has items ([`Self::tick_footage_reload`]).
+    footage_watcher: Option<effectcraft_engine::footage_reload::Watcher>,
+    /// The project revision and preference the watched set was last computed for.
+    footage_watch_key: Option<(u64, String, bool)>,
     /// The graphics device was lost and the window is closing (see `close_after_device_loss`);
     /// `true` keeps crash recovery for the next launch.
     device_lost_close: Option<bool>,
@@ -410,6 +464,10 @@ impl FileDialogsUp {
 pub(crate) struct ForwardedInput {
     pub(crate) events: Vec<egui::Event>,
     pub(crate) files: Vec<egui::DroppedFileHandle>,
+    /// Files handed over by a floating window whose panel under the pointer was the Timeline. The
+    /// paths lose the window they came from, so this keeps the one thing the import still needs
+    /// (#2661); each drop clears it.
+    pub(crate) dropped_on_timeline: bool,
 }
 
 /// Record the scale the viewer drew at (called by the viewer panel each pass).

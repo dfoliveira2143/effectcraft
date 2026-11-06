@@ -1,5 +1,5 @@
 use super::accel::Backend;
-use super::*;
+use super::{Comp, EvalCtx, ItemId, Layer, Mat4, Tick, three_d};
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -28,6 +28,11 @@ pub struct RenderOpts {
     pub nested_switches: bool,
     /// Realtime Shadows in Draft (Settings ▸ 3D): draft renders (`draft`) still cast shadows.
     pub draft_shadows: bool,
+    /// No HDR step: the top-level comp leaves the working space for the output space without
+    /// Project Settings ▸ HDR (compand / tone mapping), so over-range values stay. The consumer
+    /// decodes the frame with [`crate::color::Pipe::output_linear`] (float outputs: OpenEXR)
+    /// or applies the step itself. Part of the viewer's frame keys (`opts_hash`).
+    pub skip_hdr_step: bool,
 }
 
 impl RenderOpts {
@@ -49,6 +54,7 @@ impl Default for RenderOpts {
             backend: Backend::Cpu,
             nested_switches: true,
             draft_shadows: true,
+            skip_hdr_step: false,
             proxy: effectcraft_project::render_queue::ProxyUse::CurrentSettings,
         }
     }

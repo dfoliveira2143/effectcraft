@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, EditorState, EngineError, Event, History, ItemId, Project, Result, Session, camera_track, commands, roto, warp};
 
 impl Session {
     /// Apply an undoable edit. `merge`: consecutive edits with the same key fold into one step.
@@ -91,44 +91,118 @@ impl Session {
 
     pub fn bump(&mut self) {
         self.revision += 1;
+        // A Cryptomatte probe is keyed by the revision: an older one never answers again.
+        self.drop_crypto_probe();
         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
         if Arc::ptr_eq(&self.project, &self.saved_project) {
             self.saved_revision = self.revision;
         }
         self.refresh_disk_salt(false);
+        self.refresh_aux_footage();
         self.events.push(Event::ProjectChanged { revision: self.revision });
     }
 
     /// Salt the disk cache's layer keys with the project's footage files
-    /// ([`effectcraft_render::disk_cache::footage_salt`]). Taking it reads the size and time of
-    /// every file, every frame of an image sequence included, so it is taken again only when the
-    /// footage items changed, or with `force` (a project opened, footage reloaded, the disk cache
-    /// attached), not at every edit: with a few large sequences that cost each keystroke in a
-    /// text field over half a second (#1926).
+    /// ([`effectcraft_render::disk_cache::footage_salt`]) and attach the disk cache to the layer
+    /// cache with it. Taking it reads the size and time of every file, every frame of an image
+    /// sequence included, so it is taken again only when the footage items changed, or with
+    /// `force` (a project opened, footage reloaded, the disk cache attached), not at every edit:
+    /// with a few large sequences that cost each keystroke in a text field over half a second
+    /// (#1926).
+    ///
+    /// With [`Session::disk_salt_background`] the files are read on a worker thread: an imported
+    /// or opened project with thousands of sequence frames on a network share took half a minute
+    /// to stamp, all of it on the UI thread. Until [`Session::poll_disk_salt`] picks the salt up,
+    /// renders use the memory cache only (keys under the old salt may name other files, or
+    /// another project's items) and this returns `None`.
     pub fn refresh_disk_salt(&mut self, force: bool) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
-        if self.disk_cache.is_none() {
+        let Some(dc) = self.disk_cache.clone() else {
             self.disk_salt = None;
+            self.disk_salt_job = None;
             return None;
+        };
+        self.poll_disk_salt();
+        let footage = Self::footage_fingerprint(&self.project);
+        if !force {
+            if let Some((seen, salt)) = self.disk_salt
+                && seen == footage
+            {
+                return Some(salt);
+            }
+            if self.disk_salt_job.as_ref().is_some_and(|j| j.footage == footage) {
+                return None;
+            }
         }
+        if self.disk_salt_background && !cfg!(target_arch = "wasm32") {
+            let project = self.project.clone();
+            let slot: Arc<std::sync::Mutex<Option<u64>>> = Arc::default();
+            let out = slot.clone();
+            let spawned = std::thread::Builder::new().name("ec-disk-salt".into()).spawn(move || {
+                let salt = effectcraft_render::disk_cache::footage_salt(&project);
+                if let Ok(mut s) = out.lock() {
+                    *s = Some(salt);
+                }
+            });
+            // Without a thread the salt is taken here, as before.
+            if let Ok(thread) = spawned {
+                self.disk_salt = None;
+                self.disk_salt_job = Some(DiskSaltJob { footage, slot, thread });
+                self.layer_cache.set_disk(None);
+                return None;
+            }
+        }
+        self.disk_salt_job = None;
+        let salt = effectcraft_render::disk_cache::footage_salt(&self.project);
+        self.disk_salt = Some((footage, salt));
+        self.layer_cache.set_disk(Some((dc, salt)));
+        Some(salt)
+    }
+
+    /// Pick up a footage salt taken in the background ([`Session::refresh_disk_salt`]) and attach
+    /// the disk cache with it. Returns whether one is still being taken (frontends call this each
+    /// frame while it is).
+    pub fn poll_disk_salt(&mut self) -> bool {
+        let Some(job) = &self.disk_salt_job else { return false };
+        // (looked at first: a worker that has finished has left its salt in the slot)
+        let finished = job.thread.is_finished();
+        let salt = job.slot.lock().ok().and_then(|mut s| s.take());
+        let footage = job.footage;
+        match salt {
+            Some(salt) => {
+                self.disk_salt_job = None;
+                if let Some(dc) = self.disk_cache.clone() {
+                    self.disk_salt = Some((footage, salt));
+                    self.layer_cache.set_disk(Some((dc, salt)));
+                }
+                false
+            }
+            None if finished => {
+                // The worker stopped without a salt: the disk cache stays off until the next
+                // edit takes it again.
+                log::warn!("disk cache: the footage files could not be stamped; the disk cache is off until the next edit");
+                self.disk_salt_job = None;
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// In-memory identity of the footage settings represented by a disk salt. Workers use the
+    /// same fingerprint when preparing availability changes without disk access on the UI.
+    pub(crate) fn footage_fingerprint(project: &effectcraft_project::Project) -> u64 {
+        use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        for (id, it) in &self.project.items {
-            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
+        for (id, item) in &project.items {
+            if let effectcraft_project::ItemKind::Footage(f) = &item.kind {
                 id.hash(&mut h);
                 format!("{f:?}").hash(&mut h);
             }
+            if let Some(proxy) = &item.proxy {
+                id.hash(&mut h);
+                format!("{proxy:?}").hash(&mut h);
+            }
         }
-        let footage = h.finish();
-        if let Some((seen, salt)) = self.disk_salt
-            && seen == footage
-            && !force
-        {
-            return Some(salt);
-        }
-        let salt = effectcraft_render::disk_cache::footage_salt(&self.project);
-        self.disk_salt = Some((footage, salt));
-        self.layer_cache.set_disk_salt(salt);
-        Some(salt)
+        h.finish()
     }
 
     /// Set a comp's Resolution. As in After Effects it is saved with the project (which becomes
@@ -166,12 +240,14 @@ impl Session {
     pub fn undo(&mut self) -> bool {
         let Some((label, p)) = self.history.undo.pop() else { return false };
         let edited = commands::text_edit::active_editor_snapshot(self);
+        let probe = commands::kept_crypto_probe(self);
         let cur = std::mem::replace(&mut self.project, p);
         self.keep_view_settings(&cur);
-        self.history.redo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_after_replacement(edited.as_ref());
         self.bump();
+        commands::keep_crypto_probe(self, probe, &cur);
+        self.history.redo.push((label, cur));
         true
     }
 
@@ -182,12 +258,14 @@ impl Session {
     pub fn redo(&mut self) -> bool {
         let Some((label, p)) = self.history.redo.pop() else { return false };
         let edited = commands::text_edit::active_editor_snapshot(self);
+        let probe = commands::kept_crypto_probe(self);
         let cur = std::mem::replace(&mut self.project, p);
         self.keep_view_settings(&cur);
-        self.history.undo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_after_replacement(edited.as_ref());
         self.bump();
+        commands::keep_crypto_probe(self, probe, &cur);
+        self.history.undo.push((label, cur));
         true
     }
 
@@ -246,6 +324,11 @@ impl Session {
         self.project = Arc::new(p);
         // Its files may have changed since they were last stamped.
         self.disk_salt = None;
+        // A salt still being taken is for the old project's files: dropped, so that the next refresh
+        // stamps the new project anew (a matching fingerprint would otherwise keep the stale job).
+        self.disk_salt_job = None;
+        // The set of footage effects read the channels of is sent again, even when it is empty.
+        self.aux_footage = None;
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
@@ -262,7 +345,9 @@ impl Session {
 /// (renamed / regrouped / added parameters, reordered popups; see
 /// [`effectcraft_effects::migrate`]), and a project from before
 /// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
-/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Shape path operations get the
+/// properties added since ([`effectcraft_project::build::upgrade_shape_contents`]). Stamps the
+/// current schema.
 pub fn upgrade_effects(p: &mut Project) {
     let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
     // Effect bounds per layer: (size, top-left in layer coordinates).
@@ -285,6 +370,9 @@ pub fn upgrade_effects(p: &mut Project) {
                 Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| shift(b.1)),
                 None => d,
             };
+            if let Some(contents) = l.props.sub_mut("contents") {
+                effectcraft_project::build::upgrade_shape_contents(&mut effectcraft_project::build::Ids(&mut next), contents);
+            }
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
@@ -300,4 +388,12 @@ pub fn upgrade_effects(p: &mut Project) {
     }
     p.next_id = next;
     p.schema = effectcraft_project::SCHEMA_VERSION;
+}
+
+/// A footage salt being taken on a worker thread ([`Session::refresh_disk_salt`]).
+pub struct DiskSaltJob {
+    /// The footage it is taken for ([`Session::footage_fingerprint`]).
+    footage: u64,
+    slot: Arc<std::sync::Mutex<Option<u64>>>,
+    thread: std::thread::JoinHandle<()>,
 }

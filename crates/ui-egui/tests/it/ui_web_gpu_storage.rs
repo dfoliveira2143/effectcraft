@@ -116,12 +116,13 @@ fn source(s: &Session, gpu: Option<Gpu>) -> RenderSource {
 fn cpu_pixels(f: &FrameImage) -> Vec<egui::Color32> {
     match f {
         FrameImage::Cpu(c) => c.pixels.clone(),
-        FrameImage::Gpu(_) => panic!("expected a CPU frame"),
+        FrameImage::Gpu(_) | FrameImage::CpuF16(_) => panic!("expected an 8-bit CPU frame"),
     }
 }
 
 #[test]
 fn gpu_worker_renders_effect_frames_and_the_disk_cache_survives_a_reload() {
+    let _device = crate::gpu_test::lock();
     let (Some(page_gpu), Some(worker_gpu)) = (Gpu::headless(), Gpu::headless_deferred()) else {
         eprintln!("no GPU adapter: skipped");
         return;

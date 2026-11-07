@@ -12,6 +12,7 @@ use filmcraft_media::{FrameRequest, SharedSource};
 use image::metadata::Orientation;
 
 use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in, frame_to_image_scaled, turned};
+use crate::downmix::Order;
 use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
@@ -66,6 +67,10 @@ const CONFORM_VERSION: u32 = 3;
 /// duration comes from the file's header, and a damaged one claiming days of audio had the
 /// conform thread allocate all of it at once (#408).
 const MAX_CONFORM_SECONDS: i64 = 24 * 3600;
+
+/// The sample rates audio is read at; a header outside them is damaged or hostile (#2141).
+const MIN_SAMPLE_RATE: u32 = 1_000;
+const MAX_SAMPLE_RATE: u32 = 768_000;
 
 /// The sample frames of `footage`'s audio at `rate` Hz that a conformed file holds, `None` past
 /// [`MAX_CONFORM_SECONDS`].
@@ -174,10 +179,36 @@ struct CacheState {
     last: HashMap<Arc<str>, i64>,
 }
 
-/// A movie/audio source by path and the turn its picture is shown with
-/// ([`crate::probe::video_turn`]), opened by the first caller while the others wait for it
-/// (`None`: failed to open; not retried until `forget`).
-type SourceSlot = Arc<OnceLock<Option<(SharedSource, Orientation)>>>;
+/// A movie/audio source by path ([`Opened`]), opened by the first caller while the others wait
+/// for it (`None`: failed to open; not retried until `forget`).
+type SourceSlot = Arc<OnceLock<Option<Opened>>>;
+
+/// An opened movie/audio source, the turn its picture is shown with and the order its decoded
+/// audio channels arrive in.
+#[derive(Clone)]
+struct Opened {
+    src: SharedSource,
+    turn: Orientation,
+    order: Order,
+}
+
+impl Opened {
+    /// `src` with what its container says: `header` is an MP4/MOV's ftyp and moov (or the whole
+    /// file), `file` the file for other containers' AAC configuration.
+    fn new(src: SharedSource, header: Option<&[u8]>, file: Option<&dyn filmcraft_media::ByteReader>) -> Opened {
+        let turn = header.map_or(Orientation::NoTransforms, crate::probe::video_turn);
+        Opened { order: channel_order(&src, header, file), src, turn }
+    }
+}
+
+/// The order `src`'s audio channels decode in; multichannel AAC's by its configuration, where
+/// the container's header shows it ([`crate::aac::config`]).
+fn channel_order(src: &SharedSource, header: Option<&[u8]>, file: Option<&dyn filmcraft_media::ByteReader>) -> Order {
+    match src.info().audio() {
+        Some(a) if a.codec.contains("AAC") && a.channels > 2 => crate::aac::config(header, file).map_or(Order::Aac, |asc| crate::downmix::aac_order(&asc)),
+        _ => Order::Wav,
+    }
+}
 
 /// An animated GIF by path, as [`SourceSlot`] (the error message when it failed to load).
 type GifSlot = Arc<OnceLock<std::result::Result<Arc<Anim>, String>>>;
@@ -214,6 +245,25 @@ struct Inner {
     /// Movies that failed to open or decode (path to a readable reason; see
     /// [`FootageSource::problem`]). The first failure of a file is logged, later ones are not.
     problems: Mutex<HashMap<Arc<str>, String>>,
+    /// OpenEXR footage (by path) whose channels effects read (EXtractoR, Cryptomatte, the 3D
+    /// Channel effects): its pictures come from the same cached decode (#474).
+    aux_footage: Mutex<AuxFootage>,
+}
+
+/// Footage whose channels effects read ([`Inner::aux_footage`]), by [`Footage::path`].
+#[derive(Default)]
+struct AuxFootage {
+    /// What the project says ([`FootageSource::set_aux_footage`]).
+    given: HashSet<String>,
+    /// Read through [`FootageSource::aux`] but not given (a reader the project doesn't name, or
+    /// a source that never gives a set). Cleared with each new set.
+    learned: HashSet<String>,
+}
+
+impl AuxFootage {
+    fn contains(&self, path: &str) -> bool {
+        self.given.contains(path) || self.learned.contains(path)
+    }
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -284,6 +334,7 @@ impl MediaPool {
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
                 problems: Mutex::default(),
+                aux_footage: Mutex::default(),
             }),
         }
     }
@@ -510,18 +561,23 @@ impl MediaPool {
     /// [`MediaPool::decode_audio`], failing when the source can't be opened or read.
     fn try_decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
         let path: Arc<str> = footage.path.as_str().into();
-        let src = self.inner.source(&path).ok_or("the file can't be opened")?;
+        let Opened { src, order, .. } = self.inner.opened(&path).ok_or("the file can't be opened")?;
         let s0 = start.to_units_floor(rate as i64);
-        let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
+        let native = src.info().audio().map_or(rate, |a| a.sample_rate);
+        // The header's rate scales the samples read: 0xFFFFFFFF Hz made one conform chunk about
+        // 47 GB (#2141). Real audio is 1–768 kHz.
+        if native != 0 && !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&native) {
+            return Err(format!("a sample rate of {native} Hz is outside {MIN_SAMPLE_RATE}–{MAX_SAMPLE_RATE} Hz"));
+        }
         if native == 0 || rate == 0 || native == rate {
-            return read_stereo(&src, s0, frames, rate);
+            return read_stereo(&src, &order, s0, frames, rate);
         }
         // Output sample `n` sits at source position n × native / rate.
         let (native_i, rate_i) = (i128::from(native), i128::from(rate));
         let first = (i128::from(s0) * native_i).div_euclid(rate_i);
         let last = ((i128::from(s0) + frames as i128) * native_i).div_euclid(rate_i) + 1;
         let (Ok(first64), Ok(count)) = (i64::try_from(first), usize::try_from(last - first + 1)) else { return Ok(vec![0.0; frames * 2]) };
-        let buf = read_stereo(&src, first64, count, native)?;
+        let buf = read_stereo(&src, &order, first64, count, native)?;
         let mut out = Vec::with_capacity(frames * 2);
         for k in 0..frames as i128 {
             let pos = (i128::from(s0) + k) * native_i;
@@ -581,20 +637,15 @@ impl Inner {
         if let Some(b) = lock(&self.files).get(path) {
             return Ok(b.clone());
         }
-        std::fs::read(path).map(Into::into).map_err(|e| MediaError::Io(format!("{path}: {e}")))
+        crate::read_regular_file(std::path::Path::new(path)).map(Into::into).map_err(|e| MediaError::Io(format!("{path}: {e}")))
     }
 
-    /// The opened movie/audio source for `path`. The first caller opens it, outside the map's
-    /// lock (reading and parsing a large file takes a moment; FLAC, MP3, Ogg and AIFF files are
-    /// decoded whole); callers asking for the same file meanwhile wait for that instead of opening
-    /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
-    /// decoded a long FLAC in full at once (#408).
-    fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
-        self.opened(path).map(|(src, _)| src)
-    }
-
-    /// [`Self::source`] and the turn the movie's picture is shown with.
-    fn opened(&self, path: &Arc<str>) -> Option<(SharedSource, Orientation)> {
+    /// The opened movie/audio source for `path` ([`Opened`]). The first caller opens it, outside
+    /// the map's lock (reading and parsing a large file takes a moment; FLAC, MP3, Ogg and AIFF
+    /// files are decoded whole); callers asking for the same file meanwhile wait for that instead
+    /// of opening it again: a preview's frame workers, audio feeder, conform and waveform threads
+    /// each decoded a long FLAC in full at once (#408).
+    fn opened(&self, path: &Arc<str>) -> Option<Opened> {
         let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
         slot.get_or_init(|| {
             self.opened.fetch_add(1, Ordering::Relaxed);
@@ -604,14 +655,14 @@ impl Inner {
             let file = std::path::Path::new(&**path);
             let in_place = if in_memory { None } else { crate::stream::open_source(file) };
             let in_place = in_place.map(|src| {
-                let turn = crate::stream::movie_header(file).map_or(Orientation::NoTransforms, |h| crate::probe::video_turn(&h));
-                src.map(|src| (src, turn))
+                let (header, reader) = (crate::stream::movie_header(file), crate::stream::file_reader(file));
+                src.map(|src| Opened::new(src, header.as_deref(), reader.as_deref()))
             });
             let opened = in_place.unwrap_or_else(|| {
                 self.read(path).and_then(|bytes| {
                     let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                    let turn = crate::probe::video_turn(&bytes);
-                    filmcraft_codecs::open_bytes(&name, bytes).map(|src| (src, turn)).map_err(MediaError::from)
+                    let src = filmcraft_codecs::open_bytes(&name, bytes.clone()).map_err(MediaError::from)?;
+                    Ok(Opened::new(src, Some(&bytes), Some(&filmcraft_media::reader::MemReader(bytes.clone()))))
                 })
             });
             match opened {
@@ -685,9 +736,9 @@ impl Inner {
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
-                match footage.sequence_file(i) {
+                match footage.sequence_file_held(i) {
                     Some(path) => Loc { key: key(path, 0), media_t: None, float },
-                    // A gap in the numbering: colour bars, as in After Effects.
+                    // No file at or before the frame: colour bars.
                     None => Loc { key: key(PLACEHOLDER, ((footage.width as i64) << 32) | footage.height as i64), media_t: None, float },
                 }
             }
@@ -703,9 +754,12 @@ impl Inner {
                 let rate = footage.frame_rate;
                 let n = Self::frame_count(rate, footage.duration);
                 let i = Self::frame_index(rate, t, n, footage.loop_count);
-                // Middle of the frame in the file's own timing (robust to timestamp rounding).
+                // A quarter into the frame in the file's own timing: FilmCraft rounds a request to
+                // the track's nearest timestamp unit (halves up), so the middle of a frame would
+                // land on the next one when the timescale is the frame rate; a quarter still
+                // tolerates timestamps rounded either way.
                 let native = footage.native_rate.unwrap_or(rate);
-                let mt = native.tick_of(i) + Tick(native.frame_duration().0 / 2);
+                let mt = native.tick_of(i) + Tick(native.frame_duration().0 / 4);
                 Loc { key: key(&footage.path, i), media_t: Some(mt), float }
             }
         }
@@ -822,13 +876,22 @@ impl Inner {
         {
             return Err(MediaError::Decode(format!("{path}: {why}")));
         }
-        let loaded = crate::probe::load_oriented(&bytes, crate::still_format(path, &bytes));
-        let img = match loaded {
-            Ok(img) => img,
+        // An effect reads this footage's channels: the picture is made of the same decode (#474).
+        let shared = lock(&self.aux_footage).contains(&footage.path);
+        if shared
+            && path.to_ascii_lowercase().ends_with(".exr")
+            && let Some(img) = crate::exr_channels::cached_picture(path, bytes.clone(), op)
+        {
+            return Ok(img);
+        }
+        #[cfg(test)]
+        crate::exr_channels::count_decode(false);
+        match crate::probe::load_oriented(&bytes, crate::still_format(path, &bytes)) {
+            Ok(img) => Ok(dynamic_to_image(&img, op)),
             // A multi-layer OpenEXR file without an unnamed RGB layer: its colour layer.
-            Err(e) => crate::exr_channels::cached_layered_image(path, bytes).ok_or_else(|| MediaError::Decode(format!("{path}: {e}")))?,
-        };
-        Ok(dynamic_to_image(&img, op))
+            Err(e) => crate::exr_channels::layered_picture(path, bytes, op, shared)
+                .map_err(|why| MediaError::Decode(format!("{path}: {}", why.unwrap_or_else(|| e.to_string())))),
+        }
     }
 
     fn decode_media(&self, loc: &Loc, footage: &Footage) -> Result<Image> {
@@ -842,7 +905,7 @@ impl Inner {
                 Ok(dynamic_to_image(frame, op))
             }
             Some(mt) => {
-                let (src, turn) = self.opened(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+                let Opened { src, turn, .. } = self.opened(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
                 let vf = src
                     .video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0)))
                     .map_err(MediaError::from)
@@ -919,6 +982,16 @@ impl FootageSource for MediaPool {
         crate::layered::rasterize_vector(&footage.path, &bytes, footage.layer.as_ref(), footage.page, scale).map(Arc::new)
     }
 
+    fn set_aux_footage(&self, paths: &[String]) {
+        let given: HashSet<String> = paths.iter().cloned().collect();
+        let mut wanted = lock(&self.inner.aux_footage);
+        if given != wanted.given || !wanted.learned.is_empty() {
+            crate::exr_channels::release_held();
+        }
+        wanted.given = given;
+        wanted.learned.clear();
+    }
+
     fn aux(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<effectcraft_raster::AuxChannels>> {
         if footage.missing || !footage.has_video {
             return None;
@@ -928,6 +1001,16 @@ impl FootageSource for MediaPool {
             return None;
         }
         let path = loc.key.path.clone();
+        {
+            let mut wanted = lock(&self.inner.aux_footage);
+            if !wanted.contains(&footage.path) {
+                // (a bound: names of footage items, cleared otherwise only by a new set)
+                if wanted.learned.len() >= 4096 {
+                    wanted.learned.clear();
+                }
+                wanted.learned.insert(footage.path.clone());
+            }
+        }
         crate::exr_channels::cached(&path, || self.inner.read(&path).ok())
     }
 
@@ -941,8 +1024,8 @@ impl FootageSource for MediaPool {
 
 /// `frames` stereo sample frames (interleaved) of `src` from sample `s0` at `rate` Hz, which
 /// FilmCraft serves as decoded when it is the source's own rate. Mono is duplicated to both
-/// channels, multichannel sources are downmixed ([`crate::downmix`]); silence before the start. An error where decoding fails.
-fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
+/// channels, multichannel sources (channels in `order`) are downmixed ([`crate::downmix`]); silence before the start. An error where decoding fails.
+fn read_stereo(src: &SharedSource, order: &Order, s0: i64, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
     let mut out = vec![0.0; frames * 2];
     let skip = usize::try_from(s0.saturating_neg()).unwrap_or(0);
     if skip >= frames {
@@ -950,8 +1033,7 @@ fn read_stereo(src: &SharedSource, s0: i64, frames: usize, rate: u32) -> std::re
     }
     let buf = src.audio(s0.max(0), frames - skip, rate).map_err(|e| e.to_string())?;
     let Some(dst) = skip.checked_mul(2).and_then(|i| out.get_mut(i..)) else { return Ok(out) };
-    let aac = src.info().audio.as_ref().is_some_and(|a| a.codec.starts_with("AAC"));
-    crate::downmix::downmix_into(&buf.channels, aac, dst);
+    crate::downmix::downmix_into(&buf.channels, order, dst);
     Ok(out)
 }
 
@@ -1218,8 +1300,8 @@ mod tests {
         assert_eq!(px(&f, FloatCurve::Gamma24), g24);
     }
 
-    /// A model's material library is read beside it; one named by a path to another computer
-    /// is not read.
+    /// A model's material library is read beside it; one named by a path to another computer is
+    /// looked up under its own file name beside the model, never fetched from that machine (#1274).
     #[test]
     fn model_files_on_other_computers_are_not_read() {
         let dir = std::env::temp_dir().join(format!("ec-model-files-{}", std::process::id()));
@@ -1233,11 +1315,13 @@ mod tests {
             model.materials.iter().any(|m| m.base_color[..3] == [1.0, 0.0, 0.0])
         };
         assert!(red("beside.obj", "red.mtl"));
-        assert!(!red("unc.obj", r"\\192.0.2.1\share\red.mtl"));
-        assert!(!red("url.obj", "file://192.0.2.1/s/red.mtl"));
+        // 192.0.2.1 is a test-net address nothing here can reach, so these passes prove the
+        // material library came from beside the model, not from another computer.
+        assert!(red("unc.obj", r"\\192.0.2.1\share\red.mtl"));
+        assert!(red("url.obj", "file://192.0.2.1/s/red.mtl"));
         // Linux reads `//dir/red.mtl` as the local file.
         #[cfg(unix)]
-        assert!(!red("slashes.obj", &format!("/{}", dir.join("red.mtl").display())));
+        assert!(red("slashes.obj", &format!("/{}", dir.join("red.mtl").display())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

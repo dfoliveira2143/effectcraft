@@ -1,6 +1,6 @@
 //! Image sequences (#297): File ▸ Import with the "<format> Sequence" option, picked ranges,
 //! folders, Force Alphabetical Order, the import frame rate, Replace Footage, missing frames
-//! (placeholders, as in After Effects) and Interpret Footage ▸ Start Timecode.
+//! (they hold the previous frame) and Interpret Footage ▸ Start Timecode.
 
 use effectcraft_project::{Footage, FootageKind, ItemId, ItemKind};
 use effectcraft_time::{FrameRate, Tick};
@@ -62,12 +62,13 @@ fn one_picked_numbered_file_imports_its_run_as_one_sequence() {
     assert_eq!(name, "shot_[0001-0005].png");
     assert_eq!((f.kind, f.sequence.len(), f.alphabetical), (FootageKind::Sequence, 4, false));
     assert_eq!(f.path, at(&dir, "shot_0001.png"));
-    // Frames 1–5 at Settings ▸ Import ▸ Sequence Footage (30 fps); frame 3 is a placeholder.
+    // Frames 1–5 at Settings ▸ Import ▸ Sequence Footage (30 fps); frame 3 holds frame 2.
     assert_eq!(f.duration, FrameRate::FPS_30.tick_of(5));
     assert_eq!(f.sequence_file(2), None);
     // Settings ▸ Import ▸ Report Missing Frames.
     let w = r["warnings"][0].as_str().unwrap();
     assert!(w.contains("1 missing frame (3)"), "{w}");
+    assert!(w.contains("previous frame is held") && !w.contains("placeholder"), "{w}");
 }
 
 /// Picking every frame of a sequence used to make one item per frame (each a whole sequence on
@@ -104,10 +105,11 @@ fn numbered_stills_import_as_stills_by_default() {
     let r = s.execute("file.import", json!({"paths": [dir.clone()], "drag": true})).unwrap();
     let (name, f) = footage(&s, &r["items"][0]);
     assert_eq!((name.as_str(), f.kind), ("shot_[0001-0005].png", FootageKind::Sequence));
-    // Scripts and agents naming one frame without `sequence` still get its run.
-    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0003.png")]})).unwrap();
-    let (_, f) = footage(&s, &r["items"][0]);
-    assert_eq!(f.kind, FootageKind::Sequence);
+    // #2018: scripts and agents naming one frame without `sequence` get that still, as
+    // `ImportOptions.sequence` defaults to false in After Effects.
+    let r = s.execute("file.import", json!({"paths": [at(&dir, "shot_0005.png")]})).unwrap();
+    let (name, f) = footage(&s, &r["items"][0]);
+    assert_eq!((name.as_str(), f.kind), ("shot_0005.png", FootageKind::Still));
 }
 
 #[test]
@@ -181,14 +183,58 @@ fn interpret_footage_start_timecode_relabels_source_time() {
 }
 
 #[test]
-fn replace_footage_and_reload_keep_sequences() {
+fn replace_footage_keeps_a_still_a_still() {
     let dir = folder(&RUN);
     let mut s = session();
     let item = s.execute("file.import", json!({"paths": [at(&dir, "shot_0001.png")], "sequence": false})).unwrap()["items"][0].clone();
     s.state.project_selection = vec![ItemId(item.as_u64().unwrap())];
+    // Replacing with a numbered still does not silently turn the item into a sequence (#2073).
     s.execute("file.replaceFootage", json!({"path": at(&dir, "shot_0004.png")})).unwrap();
     let (name, f) = footage(&s, &item);
-    assert_eq!((name.as_str(), f.sequence.len()), ("shot_[0001-0005].png", 4));
+    assert_eq!((name.as_str(), f.kind), ("shot_0004.png", FootageKind::Still));
+    // JSON null is unspecified, not "on": the still stays a still.
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "shot_0004.png"), "sequence": null})).unwrap();
+    let (name, f) = footage(&s, &item);
+    assert_eq!((name.as_str(), f.kind), ("shot_0004.png", FootageKind::Still));
+    // Alphabetical is a sequence modifier, not a request to make one.
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "shot_0004.png"), "alphabetical": true})).unwrap();
+    let (name, f) = footage(&s, &item);
+    assert_eq!((name.as_str(), f.kind), ("shot_0004.png", FootageKind::Still));
+    // Asking for the run still brings it.
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "shot_0004.png"), "sequence": true})).unwrap();
+    let (name, f) = footage(&s, &item);
+    assert_eq!((name.as_str(), f.kind, f.sequence.len()), ("shot_[0001-0005].png", FootageKind::Sequence, 4));
+}
+
+#[test]
+fn replace_footage_keeps_a_one_frame_run_a_sequence() {
+    let dir = folder(&["shot_0001.png", "shot_0002.png", "solo_0007.png", "cover.png"]);
+    let mut s = session();
+    let item = s.execute("file.import", json!({"paths": [at(&dir, "shot_0001.png")], "sequence": true})).unwrap()["items"][0].clone();
+    s.state.project_selection = vec![ItemId(item.as_u64().unwrap())];
+    // A numbered file with no other frame in its run is still the replacement for a sequence.
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "solo_0007.png")})).unwrap();
+    let (name, f) = footage(&s, &item);
+    assert_eq!((name.as_str(), f.kind, f.sequence.len()), ("solo_0007.png", FootageKind::Sequence, 1));
+    // A single-file source keeps the sequence kind too.
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "cover.png")})).unwrap();
+    let (name, f) = footage(&s, &item);
+    assert_eq!((name.as_str(), f.kind, f.sequence.len()), ("cover.png", FootageKind::Sequence, 1));
+    // An explicit `sequence: false` still asks for one frame.
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "cover.png"), "sequence": false})).unwrap();
+    let (_, f) = footage(&s, &item);
+    assert_eq!((f.kind, f.sequence.len()), (FootageKind::Still, 0));
+}
+
+#[test]
+fn replace_footage_and_reload_keep_sequences() {
+    let dir = folder(&RUN);
+    let mut s = session();
+    let item = s.execute("file.import", json!({"paths": [at(&dir, "shot_0001.png")], "sequence": true})).unwrap()["items"][0].clone();
+    s.state.project_selection = vec![ItemId(item.as_u64().unwrap())];
+    s.execute("file.replaceFootage", json!({"path": at(&dir, "shot_0004.png")})).unwrap();
+    let (name, f) = footage(&s, &item);
+    assert_eq!((name.as_str(), f.kind, f.sequence.len()), ("shot_[0001-0005].png", FootageKind::Sequence, 4));
     // Reload finds a new frame and keeps the interpretation.
     s.execute("file.interpretFootage", json!({"items": [item], "frameRate": 12, "startTimecode": 2})).unwrap();
     std::fs::write(at(&dir, "shot_0003.png"), b"").unwrap();

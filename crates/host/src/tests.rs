@@ -1,6 +1,71 @@
 use serde_json::json;
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn storage_overflow_cannot_bypass_duplicate_output_protection() {
+    for same_folder in [true, false] {
+        refuse_overflow_collision(same_folder);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn refuse_overflow_collision(same_folder: bool) {
+    use std::{path::PathBuf, sync::Arc};
+    struct OverflowOnly(PathBuf);
+    impl effectcraft_project::render_queue::StorageQuota for OverflowOnly {
+        fn has_room(&self, path: &str, _: u64) -> bool {
+            std::path::Path::new(path).starts_with(&self.0)
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("ec-duplicate-overflow-{}-{same_folder}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let overflow = dir.join("overflow");
+    std::fs::create_dir_all(&overflow).unwrap();
+    let mut s = effectcraft_engine::Session {
+        exporter: Some(Arc::new(super::FileExporter::default())),
+        storage_quota: Some(Arc::new(OverflowOnly(overflow.clone()))),
+        ..Default::default()
+    };
+    Arc::make_mut(&mut s.project).render_prefs.overflow_folders = vec![overflow.to_string_lossy().into_owned(); 2];
+    s.execute("comp.new", json!({"width": 16, "height": 16, "frameRate": 10, "duration": 0.2})).unwrap();
+    for index in 0..2 {
+        let folder = if same_folder { dir.clone() } else { dir.join(index.to_string()) };
+        s.execute("renderQueue.add", json!({"format": "png", "output": folder.join("frames_[#####].png"), "skipExisting": true, "storageOverflow": true}))
+            .unwrap();
+    }
+    let result = s.execute("renderQueue.render", json!({}));
+    let written = std::fs::read_dir(&overflow).unwrap().count();
+    assert!(result.is_err(), "overflow destinations cannot skip previous frames: {result:?}");
+    assert_eq!(written, 0, "refused before any overflow file is written");
+    s.execute("renderQueue.remove", json!({"index": 2})).unwrap();
+    let result = s.execute("renderQueue.render", json!({})).unwrap();
+    assert_eq!(result["items"][0]["status"], "Done", "one output's alternatives are not separate outputs: {result}");
+    assert_eq!(std::fs::read_dir(&overflow).unwrap().count(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn memory_sink_cannot_overwrite_a_previous_output_even_with_skip_existing() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let writes = Arc::new(AtomicUsize::new(0));
+    let count = writes.clone();
+    let sink: Arc<effectcraft_export::Sink> = Arc::new(move |_, _| {
+        count.fetch_add(1, Ordering::Relaxed);
+    });
+    let mut s = effectcraft_engine::Session { exporter: Some(Arc::new(super::FileExporter { sink: Some(sink) })), ..Default::default() };
+    s.execute("comp.new", json!({"name": "Main", "width": 16, "height": 16, "frameRate": 10, "duration": 0.2})).unwrap();
+    for _ in 0..2 {
+        s.execute("renderQueue.add", json!({"format": "png", "output": "/virtual/frames_[#####].png", "skipExisting": true})).unwrap();
+    }
+    let result = s.execute("renderQueue.render", json!({}));
+    assert!(result.is_err(), "a sink cannot skip previous paths: {result:?}");
+    assert_eq!(writes.load(Ordering::Relaxed), 0, "refused before the sink receives bytes");
+}
+
+#[test]
 fn host_runs_tasks_scheduled_by_panel_handlers() {
     let mut s = super::session();
     let result = s.execute("script.run", json!({"code": "var w=new Window('palette','Timer regression'); var b=w.add('button',undefined,'Import'); b.onClick=function(){app.scheduleTask(\"app.project.items.addComp('Scheduled',64,64,1,1,25)\",0,false);};w.show();"})).unwrap();
@@ -269,7 +334,17 @@ fn value(s: &effectcraft_engine::Session, l: u64, path: &str) -> effectcraft_eng
     let cid = s.active_comp_id().unwrap();
     let comp = s.project.comp(cid).unwrap();
     let layer = comp.layer(effectcraft_engine::project::LayerId(l)).unwrap();
-    let ctx = effectcraft_engine::render::EvalCtx { project: &s.project, comp_id: cid, comp, time: Default::default(), expr: s.expr.as_deref(), footage: None };
+    let ctx = effectcraft_engine::render::EvalCtx {
+        project: &s.project,
+        comp_id: cid,
+        comp,
+        time: Default::default(),
+        expr: s.expr.as_deref(),
+        footage: None,
+        property_overrides: &[],
+        media_overrides: &[],
+        reads: None,
+    };
     ctx.value(layer, layer.props.prop(path).unwrap())
 }
 
@@ -523,8 +598,17 @@ fn stereo_rig_expressions_follow_the_master_camera() {
     let v3 = |s: &effectcraft_engine::Session, path: &str| {
         let comp = s.project.comp(left).unwrap();
         let layer = &comp.layers[0];
-        let ctx =
-            effectcraft_engine::render::EvalCtx { project: &s.project, comp_id: left, comp, time: Default::default(), expr: s.expr.as_deref(), footage: None };
+        let ctx = effectcraft_engine::render::EvalCtx {
+            project: &s.project,
+            comp_id: left,
+            comp,
+            time: Default::default(),
+            expr: s.expr.as_deref(),
+            footage: None,
+            property_overrides: &[],
+            media_overrides: &[],
+            reads: None,
+        };
         ctx.value(layer, layer.props.prop(path).unwrap()).as_vec3()
     };
     let close = |a: [f64; 3], b: [f64; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-6);
@@ -541,4 +625,36 @@ fn stereo_rig_expressions_follow_the_master_camera() {
     s.execute("prop.set", json!({"layer": ctl, "path": "effects/#1/convergence", "value": true})).unwrap();
     assert!(close(v3(&s, "transform/position"), [300.0 - d, 180.0, -800.0]), "{:?}", v3(&s, "transform/position"));
     assert!(close(v3(&s, "transform/poi"), [300.0, 180.0, 0.0]), "{:?}", v3(&s, "transform/poi"));
+}
+
+/// A text layer showing a 3D model's name (`thisComp.layer("Model").source.name`): renaming the
+/// model gives the comp a new disk key and the text shows the new name (expressions on).
+#[test]
+fn renaming_a_model_a_text_expression_reads_changes_the_key_and_the_text() {
+    use effectcraft_engine::Session;
+    let mut s = super::session();
+    let cid = effectcraft_project::ItemId(
+        s.execute("comp.new", json!({"name": "M", "width": 160, "height": 60, "frameRate": 30, "duration": 1})).unwrap()["comp"].as_u64().unwrap(),
+    );
+    let model = s
+        .edit("add model", None, |p, _| {
+            let f = effectcraft_project::Footage { kind: effectcraft_project::FootageKind::Model, ..Default::default() };
+            let model = p.add_item("chair.glb", Default::default(), None, effectcraft_project::ItemKind::Footage(f));
+            let comp = p.comp(cid).cloned().unwrap();
+            let mut l = effectcraft_project::build::layer(p, &comp, "Model", effectcraft_project::LayerSource::Model { item: model }, (16, 16), None);
+            // (not drawn: no model file; an expression still reads its source)
+            l.switches.video = false;
+            p.comp_mut(cid).unwrap().layers.push(l);
+            Ok(model)
+        })
+        .unwrap();
+    let text = s.execute("layer.newText", json!({"comp": cid.0, "text": "x"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.setExpression", json!({"comp": cid.0, "layer": text, "path": "text/sourceText", "expression": "thisComp.layer(\"Model\").source.name"}))
+        .unwrap();
+    let key = effectcraft_engine::render::disk_cache::comp_content_key(&s.project, cid);
+    let shown = |s: &mut Session| s.execute("prop.get", json!({"comp": cid.0, "layer": text, "path": "text/sourceText"})).unwrap()["evaluated"].to_string();
+    assert!(shown(&mut s).contains("chair.glb"), "{}", shown(&mut s));
+    s.execute("project.rename", json!({"item": model.0, "name": "table.glb"})).unwrap();
+    assert_ne!(effectcraft_engine::render::disk_cache::comp_content_key(&s.project, cid), key, "the comp's frames on disk hold the old name");
+    assert!(shown(&mut s).contains("table.glb"), "the text shows the new name: {}", shown(&mut s));
 }

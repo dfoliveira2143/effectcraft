@@ -307,6 +307,31 @@ impl Default for ViewerState {
 }
 
 impl TimelineState {
+    /// Whether property `uid`'s chain link (Constrain Proportions) is on. One that starts linked
+    /// (Scale, Mask Feather) records a click in `unlinked`; one that starts unlinked (shape Size,
+    /// Audio Levels) records it in `linked`.
+    pub fn is_linked(&self, uid: u64, linked_by_default: bool) -> bool {
+        if linked_by_default { !self.unlinked.contains(&uid) } else { self.linked.contains(&uid) }
+    }
+
+    /// Turn property `uid`'s chain link on or off (see [`Self::is_linked`]).
+    pub fn toggle_link(&mut self, uid: u64, linked_by_default: bool) {
+        let set = if linked_by_default { &mut self.unlinked } else { &mut self.linked };
+        if !set.remove(&uid) {
+            set.insert(uid);
+        }
+    }
+
+    /// Forget the chain links when the project was replaced (new or opened): they are keyed by
+    /// property uid, which the next project reuses, so a link turned on must not carry into it.
+    pub fn scope_links(&mut self, project_epoch: u64) {
+        if self.link_epoch != project_epoch {
+            self.link_epoch = project_epoch;
+            self.unlinked.clear();
+            self.linked.clear();
+        }
+    }
+
     /// Show `kinds` on `layers` (twirled open; empty: twirled closed) and remember it as the last
     /// reveal. Other layers keep theirs.
     pub fn apply_reveal(&mut self, layers: &[u64], kinds: Vec<String>) {
@@ -414,6 +439,13 @@ pub struct TimelineState {
     /// was turned off.
     #[serde(default)]
     pub unlinked: BTreeSet<u64>,
+    /// Shape Rectangle and Ellipse Path Size (#2489) and Audio Levels (#2485) properties whose
+    /// chain link (off by default) was turned on.
+    #[serde(default)]
+    pub linked: BTreeSet<u64>,
+    /// The project (its epoch) `unlinked` and `linked` belong to.
+    #[serde(skip)]
+    pub link_epoch: u64,
     /// Visible optional columns (column header right-click ▸ Columns): `av`, `keys`, `label`,
     /// `num`, `comment`, `switches`, `parent`, `in`, `out`, `duration`, `stretch`. The name
     /// column is always shown; Modes follows `show_modes` (F4).
@@ -466,6 +498,8 @@ impl Default for TimelineState {
             expr_closed: BTreeSet::new(),
             expr_lines: BTreeMap::new(),
             unlinked: BTreeSet::new(),
+            linked: BTreeSet::new(),
+            link_epoch: 0,
             columns: default_tl_columns(),
             source_name: false,
             scroll_to: None,
@@ -560,6 +594,36 @@ impl Default for AnimToolsState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectStatus {
+    #[default]
+    All,
+    Available,
+    Missing,
+}
+
+impl ProjectStatus {
+    pub const ALL: [Self; 3] = [Self::All, Self::Available, Self::Missing];
+    /// English catalog key; localization belongs at the widget rendering boundary.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Available => "Available",
+            Self::Missing => "Missing",
+        }
+    }
+    /// Filter the dependency inventory, including unused missing proxies. Generated items
+    /// count as available even though they have no external source file.
+    pub fn matches(self, item: &effectcraft_engine::project::Item) -> bool {
+        match self {
+            Self::All => true,
+            Self::Available => !item.has_missing_footage(),
+            Self::Missing => item.has_missing_footage(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
     pub tool: Tool,
@@ -604,6 +668,8 @@ pub struct UiState {
     pub effects_search: String,
     pub effects_open: BTreeSet<String>,
     pub project_search: String,
+    #[serde(default)]
+    pub project_status: ProjectStatus,
     pub project_open_folders: BTreeSet<u64>,
     /// Project panel sort column (`name`, `type`, `size`, `fps`) and direction, as in AE's
     /// clickable column headers. Folders sort with everything else.
@@ -618,6 +684,10 @@ pub struct UiState {
     /// Horizontal scroll of the Project panel's optional columns (Name and Label stay put).
     #[serde(default)]
     pub project_hscroll: f32,
+    /// Width of the Project panel's Name column set by dragging its edge in the header (points);
+    /// `None` fits the longest name shown (double-clicking the edge goes back to that).
+    #[serde(default)]
+    pub project_name_w: Option<f32>,
     /// Vertical scroll of the Project panel's item list (points); only visible rows are drawn.
     #[serde(default)]
     pub project_scroll: f32,
@@ -714,10 +784,12 @@ impl Default for UiState {
             effects_search: String::new(),
             effects_open: BTreeSet::new(),
             project_search: String::new(),
+            project_status: ProjectStatus::All,
             project_open_folders: BTreeSet::new(),
             project_sort: default_project_sort(),
             project_sort_desc: false,
             project_hscroll: 0.0,
+            project_name_w: None,
             project_scroll: 0.0,
             project_columns: default_project_columns(),
             fx_closed: BTreeSet::new(),

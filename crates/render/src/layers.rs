@@ -1,6 +1,16 @@
 use super::frames::adaptive_samples;
 use super::opts::{LayerTiming, Through};
-use super::*;
+use super::{
+    Arc, BlendMode, Buf, Comp, EvalCtx, Image, IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, Layer, LayerSource, Mat3,
+    MatteKind, ParallelIterator, Quality, Region, Renderer, Sampling, Tick, WarpOpts, cache, color, composite_warp_changed, masks, styles, vec2,
+};
+
+/// Blend policy for placing a layer, including optional output-depth quantization.
+struct PlacementBlend {
+    mode: BlendMode,
+    opacity: f32,
+    quantize: Option<f32>,
+}
 
 /// A motion-blur shutter: the comp's, or for a collapsed precomp's layers the outermost
 /// containing comp's (they are drawn into its frames).
@@ -24,41 +34,70 @@ impl Shutter {
     }
 }
 
+/// `files` (a content's) with the files of the buffers made of it that the layer cache kept:
+/// `files` itself when they are all its own.
+fn with_kept_files(files: Arc<crate::reads::ReadFiles>, kept: &[Arc<crate::reads::ReadFiles>]) -> Arc<crate::reads::ReadFiles> {
+    if kept.iter().all(|f| Arc::ptr_eq(f, &files)) {
+        return files;
+    }
+    let mut all = (*files).clone();
+    kept.iter().for_each(|f| all.extend(f));
+    Arc::new(all)
+}
+
 impl<'a> Renderer<'a> {
     /// The layer with its styles: exterior passes and body (cached per pass).
     pub(crate) fn styled(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<StyledLayer> {
-        let (content, ckey) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
+        let (content, ckey, files) = self.content_buf_timed(ctx, layer, timing.as_deref_mut())?;
         if !styles::active(ctx, layer) {
-            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true });
+            return Some(StyledLayer { passes: vec![], body: content.clone(), content, key: ckey, ckey, plain: true, files });
         }
         let modes = styles::pass_modes(ctx, layer);
         let key = ckey.map(|k| cache::styles_key(ctx, layer, k));
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && let Some(body) = c.get(k)
-        {
-            let passes: Option<Vec<_>> = modes.iter().enumerate().map(|(i, m)| c.get(cache::derive(k, i as u64 + 1)).map(|b| (b, *m))).collect();
+        // (a cached body or pass may have been made of other files than the content: another
+        // worker's, or one from disk; the styled layer lists the files of every buffer it holds)
+        if let Some((body, body_files)) = self.cached(key) {
+            let mut kept_files = vec![body_files];
+            let passes: Option<Vec<_>> = modes
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    self.cached(key.map(|k| cache::derive(k, i as u64 + 1))).map(|(b, f)| {
+                        kept_files.push(f);
+                        (b, *m)
+                    })
+                })
+                .collect();
             if let Some(passes) = passes {
-                return Some(StyledLayer { passes, body, content, key, ckey, plain: false });
+                let files = with_kept_files(files, &kept_files);
+                return Some(StyledLayer { passes, body, content, key, ckey, plain: false, files });
             }
         }
         let t0 = web_time::Instant::now();
-        let size = source_size(self.project, layer);
+        let size = ctx.source_size(layer);
         let layer_size = if size.0 == 0 { [ctx.comp.width as f64, ctx.comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
         let st = styles::render(ctx, layer, &content, layer_size);
         if let Some(t) = timing {
             t.cached = false;
             t.effects.push(("layerStyles".into(), t0.elapsed().as_secs_f64() * 1e3));
         }
-        let mut body = Arc::new(st.body);
-        let mut passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
-        // The buffers the cache keeps (another worker's, if it kept them first).
-        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
-            body = c.insert(k, body);
-            for (i, (b, _)) in passes.iter_mut().enumerate() {
-                *b = c.insert(cache::derive(k, i as u64 + 1), b.clone());
-            }
-        }
-        Some(StyledLayer { passes, body, content, key, ckey, plain: false })
+        // The buffers the cache keeps (another worker's, if it kept them first), made of the
+        // content's files; the styled layer then lists the files of every buffer it holds.
+        let mut kept_files = vec![];
+        let (body, f) = self.keep(key, Arc::new(st.body), &files);
+        kept_files.push(f);
+        let passes: Vec<_> = st
+            .passes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (b, m))| {
+                let (b, f) = self.keep(key.map(|k| cache::derive(k, i as u64 + 1)), Arc::new(b), &files);
+                kept_files.push(f);
+                (b, m)
+            })
+            .collect();
+        let files = with_kept_files(files, &kept_files);
+        Some(StyledLayer { passes, body, content, key, ckey, plain: false, files })
     }
 
     /// The styled layer's buffers in the blending space.
@@ -66,9 +105,10 @@ impl<'a> Renderer<'a> {
         if self.pipe.to_blend().is_none() {
             return st;
         }
-        let body = self.to_blend(st.body, st.key);
-        let content = if st.plain { body.clone() } else { self.to_blend(st.content, st.ckey) };
-        let passes = st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1))), m)).collect();
+        let body = self.to_blend(st.body, st.key, &st.files);
+        let content = if st.plain { body.clone() } else { self.to_blend(st.content, st.ckey, &st.files) };
+        let passes =
+            st.passes.into_iter().enumerate().map(|(i, (b, m))| (self.to_blend(b, st.key.map(|k| cache::derive(k, i as u64 + 1)), &st.files), m)).collect();
         StyledLayer { passes, body, content, ..st }
     }
 
@@ -226,7 +266,11 @@ impl<'a> Renderer<'a> {
     /// A processed-layer cache key that also covers content motion blur (the averaged source
     /// depends on the content at every sub-sample).
     pub(crate) fn content_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
-        let k = key?;
+        let k = self.mask_gate_key(ctx, layer, key)?;
+        // A layer that reads other layers through its effects' layer parameters gets them drawn
+        // by this renderer: the switches it passes down (Switches Affect Nested Comps, the
+        // precomp layers above, motion blur on) change those pixels, not just the layers' own.
+        let k = if cache::reads_layers(ctx, layer) { cache::derive(k, self.nested_look()) } else { k };
         let Some(times) = self.content_times(ctx, layer) else { return Some(k) };
         times.iter().try_fold(cache::derive(k, 0x6d62_6c72), |d, t| Some(cache::derive(d, cache::layer_key(&ctx.at(*t), layer, 1.0, false, false)?)))
     }
@@ -245,6 +289,15 @@ impl<'a> Renderer<'a> {
             layer: self.layer_motion_blur(layer),
             samples: if self.opts.draft { 4 } else { ctx.comp.motion_blur_samples as usize },
         }
+    }
+
+    /// A cache key of a masked layer's buffer, told apart when mask motion blur can't run at all
+    /// in this render ([`Self::mask_blur`]'s gate: the render options, the precomp layers above).
+    /// The key has the layer's own motion blur state, but a mask set to On blurs without it.
+    pub(crate) fn mask_gate_key(&self, ctx: &EvalCtx, layer: &Layer, key: Option<u64>) -> Option<u64> {
+        let k = key?;
+        let masked = layer.masks().is_some_and(|m| !m.children.is_empty());
+        Some(if masked && !self.mask_blur(ctx, layer).allowed { cache::derive(k, 0x6d62_6f66) } else { k })
     }
 
     /// Motion-blur sub-samples for a layer buffer (1 = no motion blur). As in After Effects, a 2D
@@ -342,22 +395,13 @@ impl<'a> Renderer<'a> {
 
     /// Draw a processed layer into `target` (transform, motion blur) with `mode`/`opacity`.
     pub(crate) fn place(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32) {
-        self.place_changed(ctx, layer, buf, target, mode, opacity, None);
+        self.place_changed(ctx, layer, buf, target, PlacementBlend { mode, opacity, quantize: None });
     }
 
     /// [`Self::place`], returning the target pixels it changed when the warp tracked them (then
     /// also quantised to `quantize` levels; see [`composite_warp_changed`]).
-    #[allow(clippy::too_many_arguments)]
-    fn place_changed(
-        &self,
-        ctx: &EvalCtx,
-        layer: &Layer,
-        buf: &Buf,
-        target: &mut Image,
-        mode: BlendMode,
-        opacity: f32,
-        quantize: Option<f32>,
-    ) -> Option<[u32; 4]> {
+    fn place_changed(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, blend: PlacementBlend) -> Option<[u32; 4]> {
+        let PlacementBlend { mode, opacity, quantize } = blend;
         let pl = self.placement(ctx, layer, buf);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         if let [m] = pl.matrices.as_slice() {
@@ -459,7 +503,7 @@ impl<'a> Renderer<'a> {
     fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32, quantize: Option<f32>) -> Option<[u32; 4]> {
         let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
         if !matte && !layer.preserve_transparency {
-            return self.place_changed(ctx, layer, buf, canvas, layer.blend_mode, opacity, quantize);
+            return self.place_changed(ctx, layer, buf, canvas, PlacementBlend { mode: layer.blend_mode, opacity, quantize });
         }
         // Render in isolation, then matte / preserve transparency, then blend.
         let mut iso = Image::new(canvas.width, canvas.height);
@@ -521,7 +565,7 @@ impl<'a> Renderer<'a> {
     }
 
     /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint
-    /// and its track matte.
+    /// and its track matte, and blended back in the layer's blend mode.
     fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
         let Some(mut foot) = self.source(ctx, layer) else { return };
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
@@ -547,6 +591,18 @@ impl<'a> Renderer<'a> {
         if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
             return;
         }
+        if layer.blend_mode != BlendMode::Normal {
+            // The adjusted comp is a layer in that mode over the comp below, as in After Effects:
+            // an adjustment layer with no effects in Screen screens the comp with itself (#2618).
+            let mut iso = adjusted.img;
+            iso.data.par_iter_mut().zip(matte.data.par_iter()).for_each(|(p, m)| {
+                for c in p.iter_mut() {
+                    *c *= m[3];
+                }
+            });
+            canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
+            return;
+        }
         canvas.data.par_iter_mut().zip(adjusted.img.data.par_iter()).zip(matte.data.par_iter()).for_each(|((c, a), m)| {
             let k = m[3] * opacity;
             for i in 0..4 {
@@ -569,6 +625,8 @@ pub struct StyledLayer {
     ckey: Option<u64>,
     /// No layer styles: composite `body` the usual way.
     pub plain: bool,
+    /// The source files the layer's buffers were made of (see [`crate::reads`]).
+    pub(crate) files: Arc<crate::reads::ReadFiles>,
 }
 
 /// Where a layer buffer lands (see [`Renderer::placement`]).

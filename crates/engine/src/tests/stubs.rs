@@ -519,9 +519,10 @@ fn convert_to_bezier_turns_a_parametric_shape_into_an_editable_path() {
     };
     let radius = |v: [f64; 2]| v[0].hypot(v[1]);
 
-    // A 120 x 80 rectangle is its four corners, joined by straight edges.
+    // A 120 x 80 rectangle is its four corners, joined by straight edges, from the top-right
+    // corner clockwise as After Effects draws it.
     let (mut s, l, was, rect) = convert(json!({"kind": "rect", "size": [120, 80]}));
-    assert_eq!(rect.vertices, vec![[-60.0, -40.0], [60.0, -40.0], [60.0, 40.0], [-60.0, 40.0]]);
+    assert_eq!(rect.vertices, vec![[60.0, -40.0], [60.0, 40.0], [-60.0, 40.0], [-60.0, -40.0]]);
     assert!(rect.in_tangents.iter().chain(&rect.out_tangents).all(|t| *t == [0.0, 0.0]), "straight edges: {rect:?}");
     // Undo brings the parametric shape back.
     s.execute("edit.undo", json!({})).unwrap();
@@ -582,4 +583,193 @@ fn convert_to_bezier_reads_the_shape_as_it_is_set() {
     let ys: Vec<f64> = path.vertices.iter().map(|v| v[1]).collect();
     let mid = |v: &[f64]| (v.iter().copied().fold(f64::MAX, f64::min) + v.iter().copied().fold(f64::MIN, f64::max)) / 2.0;
     assert!((mid(&xs) - 10.0).abs() < 1e-6 && (mid(&ys) - 5.0).abs() < 1e-6, "centred on the position: {:?} {:?}", mid(&xs), mid(&ys));
+}
+
+/// #1896: Convert To Bezier Path reads Per-Corner Roundness, not just the uniform Roundness, so
+/// the editable path is the shape that was on screen.
+#[test]
+fn convert_to_bezier_honours_per_corner_roundness() {
+    let mut s = comp();
+    let l = s.execute("layer.newShape", json!({"kind": "rect", "size": [120, 80]})).unwrap()["layer"].as_u64().unwrap();
+    let (uid, _) = first_shape(&s, l);
+    let uid_of = |s: &Session, id: &str| layer(s, l).props.sub("contents").unwrap().find_group(uid).unwrap().get(id).unwrap().uid;
+    let per_corner = uid_of(&s, "perCorner");
+    let top_left = uid_of(&s, "topLeftRoundness");
+    let bottom_right = uid_of(&s, "bottomRightRoundness");
+    for (u, v) in [(per_corner, json!(true)), (top_left, json!(20.0)), (bottom_right, json!(10.0))] {
+        s.execute("prop.set", json!({"layer": l, "path": format!("@{u}"), "value": v})).unwrap();
+    }
+
+    s.state.selected_props = vec![(LayerId(l), uid)];
+    s.execute("path.convertToBezier", json!({})).unwrap();
+    let (new_uid, now) = first_shape(&s, l);
+    assert_eq!(now, "path");
+    let path = shape_path_of(&s, l, new_uid);
+    let expected = effectcraft_path::from_kurbo(&effectcraft_path::rect_radii([120.0, 80.0], [0.0, 0.0], [20.0, 0.0, 10.0, 0.0])).into_iter().next().unwrap();
+    assert_eq!(path, expected, "the converted path has the per-corner geometry");
+}
+
+/// #1896: Convert To Bezier Path evaluates the shape's expressions, so an expression-driven
+/// Per-Corner checkbox and radius convert to the geometry on screen.
+#[test]
+fn convert_to_bezier_evaluates_corner_expressions() {
+    struct Corners;
+    impl effectcraft_render::ExprHost for Corners {
+        fn eval(
+            &self,
+            _: &effectcraft_render::EvalCtx,
+            _: &effectcraft_project::Layer,
+            prop: &effectcraft_project::Property,
+            value: &KV,
+        ) -> std::result::Result<KV, String> {
+            Ok(match prop.match_id.as_str() {
+                "perCorner" => KV::Bool(true),
+                "topLeftRoundness" => KV::Scalar(20.0),
+                _ => value.clone(),
+            })
+        }
+    }
+
+    let mut s = comp();
+    s.expr = Some(Arc::new(Corners));
+    let l = s.execute("layer.newShape", json!({"kind": "rect", "size": [120, 80]})).unwrap()["layer"].as_u64().unwrap();
+    let (uid, _) = first_shape(&s, l);
+    let uid_of = |s: &Session, id: &str| layer(s, l).props.sub("contents").unwrap().find_group(uid).unwrap().get(id).unwrap().uid;
+    for (id, expression) in [("perCorner", "true"), ("topLeftRoundness", "20")] {
+        let u = uid_of(&s, id);
+        s.execute("prop.setExpression", json!({"layer": l, "path": format!("@{u}"), "expression": expression})).unwrap();
+    }
+
+    s.state.selected_props = vec![(LayerId(l), uid)];
+    s.execute("path.convertToBezier", json!({})).unwrap();
+    let (new_uid, now) = first_shape(&s, l);
+    assert_eq!(now, "path");
+    let path = shape_path_of(&s, l, new_uid);
+    let expected = effectcraft_path::from_kurbo(&effectcraft_path::rect_radii([120.0, 80.0], [0.0, 0.0], [20.0, 0.0, 0.0, 0.0])).into_iter().next().unwrap();
+    assert_eq!(path, expected, "the expression-evaluated corner is converted");
+}
+
+/// #2201: a viewer drag on the free-transform box sends one `path.freeTransform` per frame with a
+/// shared merge key; one undo must revert the whole drag, not the last frame.
+#[test]
+fn free_transform_drag_undoes_in_one_step() {
+    let mut s = comp();
+    let (l, m) = masked(&mut s);
+    s.state.selected_vertices.clear();
+    let before = mask_path(&s, l, m);
+    for k in [90, 90, 90, 90] {
+        s.execute("path.freeTransform", json!({"layer": l, "scale": k, "merge": "viewer-drag-1"})).unwrap();
+    }
+    let after = mask_path(&s, l, m);
+    assert_ne!(after, before);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), before, "one undo reverts the whole drag");
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m), after, "redo restores the whole drag");
+}
+
+fn bounds(p: &effectcraft_keyframe::ShapePath) -> ([f64; 2], [f64; 2]) {
+    let lo = p.vertices.iter().fold([f64::MAX; 2], |a, v| [a[0].min(v[0]), a[1].min(v[1])]);
+    let hi = p.vertices.iter().fold([f64::MIN; 2], |a, v| [a[0].max(v[0]), a[1].max(v[1])]);
+    (lo, hi)
+}
+
+#[test]
+fn rounded_mask_roundness_is_set_on_creation_and_editable() {
+    let mut s = comp();
+    let l = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 400, "height": 300})).unwrap()["layer"].as_u64().unwrap();
+    // A 20 px radius by default; an explicit radius moves the first vertex.
+    let m = s.execute("layer.addMask", json!({"layer": l, "shape": "rounded", "rect": [100, 100, 200, 100]})).unwrap()["mask"].as_u64().unwrap();
+    let default = mask_path(&s, l, m);
+    assert_eq!(default.vertices[0], [300.0, 120.0]);
+    let m2 =
+        s.execute("layer.addMask", json!({"layer": l, "shape": "rounded", "rect": [100, 100, 200, 100], "roundness": 30})).unwrap()["mask"].as_u64().unwrap();
+    assert_eq!(mask_path(&s, l, m2).vertices[0], [300.0, 130.0]);
+    assert!(s.execute("layer.addMask", json!({"layer": l, "shape": "ellipse", "roundness": 5})).is_err());
+    assert!(s.execute("layer.addMask", json!({"layer": l, "shape": "rounded", "roundness": -1})).is_err());
+    // Edit it afterwards: same box, new radius; 0 is a plain rectangle; undo restores.
+    s.execute("mask.setRoundness", json!({"layer": l, "mask": m, "roundness": 50})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert_eq!(p.vertices[0], [300.0, 150.0]);
+    assert_eq!(bounds(&p), ([100.0, 100.0], [300.0, 200.0]));
+    s.execute("mask.setRoundness", json!({"layer": l, "mask": m, "roundness": 0})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert_eq!(p.vertices.len(), 4);
+    assert_eq!(bounds(&p), ([100.0, 100.0], [300.0, 200.0]));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mask_path(&s, l, m).vertices[0], [300.0, 150.0]);
+}
+
+#[test]
+fn set_roundness_refuses_what_is_not_a_rectangle() {
+    let mut s = comp();
+    let l = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 400, "height": 300})).unwrap()["layer"].as_u64().unwrap();
+    let star = s.execute("layer.addMask", json!({"layer": l, "shape": "star"})).unwrap()["mask"].as_u64().unwrap();
+    let before = mask_path(&s, l, star);
+    assert!(s.execute("mask.setRoundness", json!({"layer": l, "mask": star, "roundness": 10})).is_err());
+    assert_eq!(mask_path(&s, l, star), before, "a refused edit leaves the mask alone");
+    assert!(s.execute("mask.setRoundness", json!({"layer": l, "mask": star})).is_err(), "needs a roundness");
+    // A diamond inscribed in its box touches every edge but is not a rectangle.
+    s.execute("mask.new", json!({"layer": l, "vertices": [[150, 100], [200, 150], [150, 200], [100, 150]], "closed": true})).unwrap();
+    let diamond = layer(&s, l).masks().unwrap().groups().last().unwrap().uid;
+    assert!(s.execute("mask.setRoundness", json!({"layer": l, "mask": diamond, "roundness": 10})).is_err());
+    assert_eq!(mask_path(&s, l, diamond).vertices.len(), 4);
+    // "roundness": null is unset, and an unknown shape is reported as such.
+    s.execute("layer.addMask", json!({"layer": l, "shape": "rounded", "roundness": null})).unwrap();
+    let e = s.execute("layer.addMask", json!({"layer": l, "shape": "foo", "roundness": 5})).unwrap_err().to_string();
+    assert!(e.contains("unknown shape"), "{e}");
+}
+
+#[test]
+fn set_roundness_refuses_an_ellipse_and_keeps_feather_points_and_keys_in_step() {
+    let mut s = comp();
+    let l = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 400, "height": 300})).unwrap()["layer"].as_u64().unwrap();
+    let add = |s: &mut Session, shape: &str, rect: [u32; 4], extra: serde_json::Value| {
+        let mut p = json!({"layer": l, "shape": shape, "rect": rect});
+        if let (Some(p), Some(e)) = (p.as_object_mut(), extra.as_object()) {
+            p.extend(e.clone());
+        }
+        s.execute("layer.addMask", p).unwrap()["mask"].as_u64().unwrap()
+    };
+    // An ellipse (or a circle) has its four vertices on its box's edges and curved sides, but it
+    // is not a rectangle: refused, unchanged.
+    for rect in [[100, 100, 200, 100], [100, 100, 100, 100]] {
+        let e = add(&mut s, "ellipse", rect, json!({}));
+        let before = mask_path(&s, l, e);
+        assert!(s.execute("mask.setRoundness", json!({"layer": l, "mask": e, "roundness": 10})).is_err(), "{rect:?}");
+        assert_eq!(mask_path(&s, l, e), before);
+    }
+    // A feather point on the top side survives a rounded-to-rounded edit, still on the top side.
+    let m = add(&mut s, "rounded", [100, 100, 200, 100], json!({"roundness": 30}));
+    s.execute("mask.featherPoint.add", json!({"layer": l, "mask": m, "point": [200, 90]})).unwrap();
+    let on_top = |p: &effectcraft_keyframe::ShapePath| {
+        let f = &p.feather[0];
+        let n = p.vertices.len();
+        p.vertices[f.segment % n][1] == 100.0 && p.vertices[(f.segment + 1) % n][1] == 100.0
+    };
+    assert!(on_top(&mask_path(&s, l, m)));
+    s.execute("mask.setRoundness", json!({"layer": l, "mask": m, "roundness": 50})).unwrap();
+    let p = mask_path(&s, l, m);
+    assert_eq!((p.vertices.len(), p.feather.len()), (8, 1));
+    assert!(on_top(&p), "{p:?}");
+    // Square corners would drop four vertices under the feather point: refused.
+    assert!(s.execute("mask.setRoundness", json!({"layer": l, "mask": m, "roundness": 0})).is_err());
+    assert_eq!(mask_path(&s, l, m), p);
+    // A keyed path: a rounded one is re-rounded with its vertex count kept, so its keys still
+    // interpolate; a square one can't gain the corner vertices on one key only.
+    let keys = |s: &Session, m: u64| -> Vec<usize> {
+        let g = layer(s, l).masks().unwrap().find_group(m).unwrap().clone();
+        g.get("path").unwrap().keys.iter().map(|k| k.value.as_path().unwrap().vertices.len()).collect()
+    };
+    let r = add(&mut s, "rounded", [100, 100, 200, 100], json!({"roundness": 20}));
+    let q = add(&mut s, "rect", [100, 100, 200, 100], json!({}));
+    for (i, mask) in [(4, r), (5, q)] {
+        s.execute("time.set", json!({"time": 0})).unwrap();
+        s.execute("prop.addKey", json!({"layer": l, "path": format!("masks/#{i}/path"), "time": 0.0})).unwrap();
+        s.execute("time.set", json!({"time": 1})).unwrap();
+        let ok = s.execute("mask.setRoundness", json!({"layer": l, "mask": mask, "roundness": 40})).is_ok();
+        assert_eq!(ok, mask == r);
+    }
+    assert_eq!(keys(&s, r), [8, 8]);
+    assert_eq!(keys(&s, q), [4]);
 }

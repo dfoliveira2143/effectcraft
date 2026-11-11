@@ -1,8 +1,11 @@
-use super::*;
+use super::{Comp, CompSelection, Event, ItemId, LayerId, Result, Session, Tick, Value, commands};
 
-/// `t` as a current time of `comp`: a frame within its duration.
+/// `t` as a current time of `comp`: a frame within its duration. The last frame is the last one
+/// that starts before the end, so a final partial frame (a duration off the frame grid after a
+/// frame-rate change) stays reachable; on the grid it is `duration - frame_duration`.
 fn comp_frame_at(comp: &Comp, t: Tick) -> Tick {
-    comp.frame_rate.snap_nearest(t.min(comp.duration - comp.frame_duration()).max(Tick::ZERO))
+    let last = comp.frame_rate.snap(comp.duration - Tick(1)).max(Tick::ZERO);
+    comp.frame_rate.snap_nearest(t.max(Tick::ZERO)).min(last)
 }
 
 impl Session {
@@ -22,12 +25,31 @@ impl Session {
     /// when the snapshot was taken; if one is open after the replacement it is treated as an
     /// unverified document replacement, so it never inherits an old composition.
     pub fn sanitize_after_replacement(&mut self, before: Option<&commands::text_edit::EditorSnapshot>) {
+        let project = self.project.clone();
+        self.retain_mask_reveals_in(&project);
         self.sanitize_state();
         commands::text_edit::after_replacement(self, before);
     }
 
+    /// Drop reveals for removed masks before the restored allocator can reuse their IDs.
+    pub(crate) fn retain_mask_reveals_in(&mut self, project: &crate::Project) {
+        self.events.retain(|event| {
+            let Event::Frontend { command, params } = event else { return true };
+            if command != "timeline.revealMask" {
+                return true;
+            }
+            let comp = params.get("comp").and_then(Value::as_u64).map(ItemId).and_then(|id| project.comp(id));
+            let layer = params.get("layer").and_then(Value::as_u64).map(LayerId).and_then(|id| comp.and_then(|c| c.layer(id)));
+            let mask = params.get("mask").and_then(Value::as_u64);
+            layer.and_then(|l| l.masks()).is_some_and(|m| m.groups().any(|g| Some(g.uid) == mask))
+        });
+    }
+
     /// Drop selections that no longer exist. Each comp keeps its own selection (#1001); a layer id
     /// counts only inside the comp that owns it, so the active comp never sees another comp's layers.
+    /// Validate property UIDs too: undo can remove a control and rewind the allocator, so keeping
+    /// its selection could silently select a different property when the UID is reused. Group
+    /// selections remain valid even though groups are not leaf properties.
     pub fn sanitize_state(&mut self) {
         let p = self.project.clone();
         self.state.open_comps.retain(|c| p.comp(*c).is_some());
@@ -35,8 +57,8 @@ impl Session {
             let Some(c) = p.comp(*cid) else { return false };
             let ids: Vec<LayerId> = c.layers.iter().map(|l| l.id).collect();
             sel.layers.retain(|l| ids.contains(l));
-            sel.props.retain(|(l, _)| ids.contains(l));
-            sel.keys.retain(|k| ids.contains(&k.layer));
+            sel.props.retain(|(lid, uid)| c.layer(*lid).is_some_and(|l| l.props.find(*uid).is_some() || l.props.find_group(*uid).is_some()));
+            sel.keys.retain(|k| c.layer(k.layer).is_some_and(|l| l.props.find(k.prop).is_some()));
             sel.vertices.retain(|v| ids.contains(&v.layer));
             !sel.is_empty()
         });
@@ -49,11 +71,11 @@ impl Session {
                 self.recall_selection(id);
             }
         }
-        if let Some(c) = self.active_comp() {
+        if let Some(c) = self.state.active_comp.and_then(|cid| p.comp(cid)) {
             let ids: Vec<LayerId> = c.layers.iter().map(|l| l.id).collect();
             self.state.selected_layers.retain(|l| ids.contains(l));
-            self.state.selected_props.retain(|(l, _)| ids.contains(l));
-            self.state.selected_keys.retain(|k| ids.contains(&k.layer));
+            self.state.selected_props.retain(|(lid, uid)| c.layer(*lid).is_some_and(|l| l.props.find(*uid).is_some() || l.props.find_group(*uid).is_some()));
+            self.state.selected_keys.retain(|k| c.layer(k.layer).is_some_and(|l| l.props.find(k.prop).is_some()));
             self.state.selected_vertices.retain(|v| ids.contains(&v.layer));
         }
         if let Some((l, t)) = self.state.current_track
@@ -95,16 +117,21 @@ impl Session {
     /// editor is open, so playback with no text editor does no text copying.
     pub fn set_time(&mut self, t: Tick) {
         if let Some(c) = self.state.active_comp {
-            let t = self.project.comp(c).map_or(t, |comp| comp_frame_at(comp, t));
-            let edited = commands::text_edit::active_editor_snapshot(self);
-            self.state.times.insert(c, t);
-            if self.prefs.general.sync_time_related_items {
-                // Direct call: this `set_time` owns the editor snapshot for both time changes,
-                // so a synced move does not take a second snapshot or start a second epoch.
-                self.sync_related_times_inner(c, t);
-            }
-            commands::text_edit::after_external_change(self, edited.as_ref());
+            self.set_time_of(c, t);
         }
+    }
+
+    /// Move `comp`'s current time, as [`Session::set_time`] does for the active comp.
+    pub fn set_time_of(&mut self, c: ItemId, t: Tick) {
+        let t = self.project.comp(c).map_or(t, |comp| comp_frame_at(comp, t));
+        let edited = commands::text_edit::active_editor_snapshot(self);
+        self.state.times.insert(c, t);
+        if self.prefs.general.sync_time_related_items {
+            // Direct call: this `set_time_of` owns the editor snapshot for both time changes,
+            // so a synced move does not take a second snapshot or start a second epoch.
+            self.sync_related_times_inner(c, t);
+        }
+        commands::text_edit::after_external_change(self, edited.as_ref());
     }
 
     /// Settings ▸ General ▸ Synchronize Time of All Related Items: moving the current time of
@@ -120,8 +147,8 @@ impl Session {
 
     /// Sets the time of every comp related to `comp` through precomp layers: down into the comps
     /// it nests (through each layer's timing) and up into the comps nesting it. A seen-set keeps
-    /// cycles and diamonds finite; each found time is clamped to its comp's last frame, snapped to
-    /// the nearest frame and stored in `state.times`. The caller owns the text-editor boundary.
+    /// cycles and diamonds finite; each found time goes through [`comp_frame_at`] (as a direct move
+    /// does) and is stored in `state.times`. The caller owns the text-editor boundary.
     fn sync_related_times_inner(&mut self, comp: ItemId, t: Tick) {
         let mut seen = std::collections::BTreeSet::from([comp]);
         let mut todo = vec![(comp, t)];
@@ -151,7 +178,7 @@ impl Session {
         }
         for (cid, ct) in found {
             if let Some(c) = self.project.comp(cid) {
-                let ct = c.frame_rate.snap_nearest(ct.clamp(Tick::ZERO, (c.duration - c.frame_duration()).max(Tick::ZERO)));
+                let ct = comp_frame_at(c, ct);
                 self.state.times.insert(cid, ct);
             }
         }

@@ -26,7 +26,7 @@ function __err(msg) {
 }
 function __num(v, what) {
   var n = Number(v);
-  if (typeof v === "boolean" || isNaN(n)) throw __err((what || "value") + " must be a number");
+  if (typeof v === "boolean" || Number.isNaN(n)) throw __err((what || "value") + " must be a number");
   return n;
 }
 function __str(v) {
@@ -43,11 +43,11 @@ if (typeof String.prototype.substr !== "function") {
       if (this === null || this === undefined) throw new TypeError("String.substr called on null or undefined");
       var text = String(this), n = text.length;
       var from = Number(start);
-      if (isNaN(from)) from = 0;
+      if (Number.isNaN(from)) from = 0;
       // ToIntegerOrInfinity, then clamp positive or negative offsets.
       from = from < 0 ? Math.max(n + Math.ceil(from), 0) : Math.min(Math.floor(from), n);
       var count = length === undefined ? n - from : Number(length);
-      if (isNaN(count) || count <= 0) return "";
+      if (Number.isNaN(count) || count <= 0) return "";
       return text.slice(from, from + count);
     },
     writable: true, configurable: true
@@ -189,7 +189,12 @@ BridgeTalk.pump = function () { return false; };
 
 // ------------------------------------------------------------------ File / Folder
 
-function __join(a, b) { return a.replace(/[\/\\]+$/, "") + "/" + b; }
+function __trimPathSeparators(path) {
+  var end = path.length;
+  while (end > 0 && (path.charAt(end - 1) === "/" || path.charAt(end - 1) === "\\")) end--;
+  return path.slice(0, end);
+}
+function __join(a, b) { return __trimPathSeparators(a) + "/" + b; }
 
 function File(path) {
   if (!(this instanceof File)) return new File(path);
@@ -292,9 +297,9 @@ Folder.prototype = {
   get fsName() { return this.__path; },
   get fullName() { return this.__path; },
   get absoluteURI() { return this.__path; },
-  get name() { return this.__path.replace(/[\/\\]+$/, "").split(/[\/\\]/).pop(); },
+  get name() { return __trimPathSeparators(this.__path).split(/[\/\\]/).pop(); },
   get displayName() { return this.name; },
-  get path() { var p = this.__path.replace(/[\/\\]+$/, "").split(/[\/\\]/); p.pop(); return p.join("/"); },
+  get path() { var p = __trimPathSeparators(this.__path).split(/[\/\\]/); p.pop(); return p.join("/"); },
   get parent() { return new Folder(this.path); },
   get exists() { return JSON.parse(__file("isDir", this.__path)) === true; },
   toString: function () { return this.__path; },
@@ -431,7 +436,7 @@ function __callable(o) {
 // 1-based collections with `[n]` access.
 var __coll = {
   get: function (t, k, r) {
-    if (typeof k === "string" && /^[0-9]+$/.test(k)) return t.__at(parseInt(k, 10));
+    if (typeof k === "string" && /^[0-9]+$/.test(k)) return t.__at(Number.parseInt(k, 10));
     return Reflect.get(t, k, r);
   },
 };
@@ -729,9 +734,8 @@ PropertyGroup.prototype.addProperty = function (name) {
   } else if (r.kind === "animator") {
     uid = __call("layer.addTextAnimator", { comp: L.__comp, layer: L.__id, properties: [] }).animator;
   } else if (r.kind === "animatorProperty") {
-    var before = this.numProperties;
-    __call("layer.addTextAnimatorProperty", { comp: L.__comp, layer: L.__id, animator: r.animator, property: r.property });
-    return this.property(before + 1);
+    var added = __call("layer.addTextAnimatorProperty", { comp: L.__comp, layer: L.__id, animator: r.animator, property: r.property });
+    return this.property(added.index);
   } else if (r.kind === "selector") {
     var n0 = this.numProperties;
     __call("layer.addTextSelector", { comp: L.__comp, layer: L.__id, animator: r.animator, kind: r.selector });
@@ -862,6 +866,12 @@ Property.prototype.property = function () { return null; };
       var idx = v?.__id !== undefined ? v.index : __num(v);
       if (!idx) return null;
       return this.__layer.containingComp.layer(idx).__id;
+    }
+    // A string parameter (a LUT or look file, a text field) takes the text, or a File's path (#3395).
+    // A hidden one (Mesh Warp's mesh) stays refused by the key setters too, as by setValue.
+    if (info.type === "string") {
+      if (info.hidden) throw __err("\"" + info.name + "\" can not be set");
+      return __str(v);
     }
     if (info.type === "enum") return __num(v) - 1;
     if (info.type === "bool") return typeof v === "boolean" ? v : __num(v) !== 0;
@@ -1648,7 +1658,7 @@ CompItem.prototype.constructor = CompItem;
   P.saveFrameToPng = function (time, file) {
     var f = __str(file);
     if (!f) throw __err("saveFrameToPng: missing file");
-    __file("write", f, "");
+    __file("checkWrite", f);
     __call("comp.saveFrameAs", { comp: this.__id, path: f, time: __num(time, "time") });
   };
   P.openInEssentialGraphics = function () { __call("comp.openInEssentialGraphics", { comp: this.__id }); };
@@ -1658,8 +1668,8 @@ CompItem.prototype.constructor = CompItem;
     if (!/\.[A-Za-z0-9]+$/.test(f)) f += ".ectemplate";
     if (!overwrite && JSON.parse(__file("exists", f)) === true) return false;
     if (this.__controllers().length === 0) return false;
-    // The file gate applies to templates too.
-    __file("write", f, "");
+    // The file gate applies to templates too (checked without touching the file).
+    __file("checkWrite", f);
     __call("essential.exportTemplate", { comp: this.__id, path: f });
     return true;
   };
@@ -1702,7 +1712,8 @@ Object.defineProperty(FootageItem.prototype, "mainSource", {
     return this.__mainSource;
   },
 });
-FootageItem.prototype.replace = function (f) { __call("file.replaceFootage", { item: this.__id, path: __str(f) }); };
+// replace() swaps in one file, even a numbered still (replaceWithSequence brings a run), as in After Effects.
+FootageItem.prototype.replace = function (f) { __call("file.replaceFootage", { item: this.__id, path: __str(f), sequence: false }); };
 FootageItem.prototype.replaceWithSequence = function (f, forceAlphabetical) {
   __call("file.replaceFootage", { item: this.__id, path: __str(f), sequence: true, alphabetical: !!forceAlphabetical });
 };

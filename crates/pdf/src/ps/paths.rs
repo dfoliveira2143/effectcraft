@@ -1,5 +1,5 @@
 use super::value::{Flow, V};
-use super::*;
+use super::{Affine, BezPath, FillRule, Interp, MAX_PATH, Paint, PathEl, Point, Stroke};
 
 /// The angle from `a` counterclockwise to `b` (degrees, 0 to 360), worked out from what is left
 /// of each after whole turns.
@@ -22,7 +22,7 @@ impl Interp {
     }
 
     /// Stop the program when a path of `len` elements would be longer than [`MAX_PATH`].
-    fn path_fits(&mut self, len: usize) -> Result<(), Flow> {
+    pub(super) fn path_fits(&mut self, len: usize) -> Result<(), Flow> {
         if len <= MAX_PATH {
             return Ok(());
         }

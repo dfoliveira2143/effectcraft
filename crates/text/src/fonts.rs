@@ -107,17 +107,29 @@ fn extra_dirs(var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     var.map(|v| std::env::split_paths(v).filter(|p| !p.as_os_str().is_empty()).collect()).unwrap_or_default()
 }
 
-fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            // Bounded, so a symlink loop ends.
-            if depth < 8 {
-                walk(&p, depth + 1, out);
+/// Font files under `roots`, each real folder listed once. Breadth first from every root, so a
+/// folder reached by several routes is listed at its shallowest and keeps the most depth below it.
+fn walk(roots: &[PathBuf], out: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, u32)> = roots.iter().map(|r| (r.clone(), 0)).collect();
+    while let Some((dir, depth)) = queue.pop_front() {
+        // Symlinks fanning out to the same folders would otherwise be walked again along every
+        // path to them (exponentially many within the depth bound).
+        if !seen.insert(std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                // Bounded, so a symlink loop ends.
+                if depth < 8 {
+                    queue.push_back((p, depth + 1));
+                }
+            } else if p.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc"))
+            {
+                out.push(p);
             }
-        } else if p.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|x| matches!(x.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc" | "otc")) {
-            out.push(p);
         }
     }
 }
@@ -125,9 +137,7 @@ fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
 impl FontSource for DirectorySource {
     fn faces(&self) -> Vec<FaceInfo> {
         let mut files = Vec::new();
-        for d in &self.dirs {
-            walk(d, 0, &mut files);
-        }
+        walk(&self.dirs, &mut files);
         files.sort();
         files.dedup();
         let mut out = Vec::new();
@@ -163,6 +173,8 @@ pub struct Face {
     pub id: FaceId,
     pub info: FaceInfo,
     bytes: OnceLock<Option<FaceBytes>>,
+    /// The file's metadata as its bytes were read (a [`FaceData::File`] face, once loaded).
+    file_meta: OnceLock<std::fs::Metadata>,
     shaper: OnceLock<harfrust::ShaperData>,
 }
 
@@ -194,16 +206,59 @@ pub struct VMetrics {
     pub underline_thickness: f32,
 }
 
+/// A font file's bytes, shared by every face of it that is loaded (the faces of a collection
+/// each held their own copy of the whole file), with the metadata of the open file they were read
+/// from (so it describes the bytes, not a later version of the file).
+fn file_bytes(p: &std::path::Path) -> std::io::Result<(Arc<Vec<u8>>, std::fs::Metadata)> {
+    use std::io::Read;
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    type Entry = (std::sync::Weak<Vec<u8>>, std::fs::Metadata);
+    static FILES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Key, Entry>>> = std::sync::LazyLock::new(Default::default);
+    let lock = || FILES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hit = |files: &std::collections::HashMap<Key, Entry>, key: &Key| files.get(key).and_then(|(w, m)| Some((w.upgrade()?, m.clone())));
+    let mut f = std::fs::File::open(p)?;
+    // Keyed by size and modification time too: a file replaced at the same path is read afresh.
+    let m = f.metadata()?;
+    let key: Key = (p.to_path_buf(), m.len(), m.modified().ok());
+    if let Some(found) = hit(&lock(), &key) {
+        return Ok(found);
+    }
+    // Read outside the lock: a slow file must not hold up every other face's first load.
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    let b = Arc::new(bytes);
+    let mut files = lock();
+    if let Some(found) = hit(&files, &key) {
+        return Ok(found);
+    }
+    files.retain(|_, (w, _)| w.strong_count() > 0);
+    files.insert(key, (Arc::downgrade(&b), m.clone()));
+    Ok((b, m))
+}
+
 impl Face {
+    /// The font file bytes, loaded once on first use, or `None` when they cannot be read.
     fn bytes(&self) -> Option<&[u8]> {
         self.bytes
             .get_or_init(|| match &self.info.data {
                 FaceData::Static(b) => Some(FaceBytes::Static(b)),
                 FaceData::Shared(b) => Some(FaceBytes::Shared(b.clone())),
-                FaceData::File(p) => std::fs::read(p).ok().map(|v| FaceBytes::Shared(Arc::new(v))),
+                FaceData::File(p) => {
+                    let (bytes, meta) = file_bytes(p).ok()?;
+                    let _ = self.file_meta.set(meta);
+                    Some(FaceBytes::Shared(bytes))
+                }
             })
             .as_ref()
             .map(FaceBytes::get)
+    }
+    /// The file a [`FaceData::File`] face is drawn from, with its metadata as its bytes were read
+    /// (`None` when it could not be read): what text drawn with the face was made of. Loads the
+    /// face. `None` for bundled faces and faces from memory.
+    pub fn file_read(&self) -> Option<(&std::path::Path, Option<&std::fs::Metadata>)> {
+        let FaceData::File(p) = &self.info.data else { return None };
+        let _ = self.bytes();
+        Some((p, self.file_meta.get()))
     }
     /// The parsed font (None if the file is missing or unreadable).
     pub fn font(&self) -> Option<FontRef<'_>> {
@@ -292,15 +347,37 @@ impl Face {
 }
 
 struct Db {
+    fallback: Arc<Face>,
     faces: Vec<Arc<Face>>,
     scanned: bool,
+}
+
+/// Keep the compiled-in regular face available independently of discovery results.
+fn bundled_default_face() -> Arc<Face> {
+    let info =
+        read_faces_bytes(INTER_REGULAR).into_iter().next().map(|n| info_from(n, FaceData::Static(INTER_REGULAR), "bundled")).unwrap_or_else(|| FaceInfo {
+            family: DEFAULT_FAMILY.into(),
+            style: "Regular".into(),
+            weight: 400,
+            italic: false,
+            index: 0,
+            data: FaceData::Static(INTER_REGULAR),
+            origin: "bundled",
+            native_family: None,
+            full_name: "Inter Regular".into(),
+            postscript: Some("Inter-Regular".into()),
+            variable: false,
+            instances: Vec::new(),
+        });
+    Arc::new(Face { id: 0, info, bytes: OnceLock::new(), file_meta: OnceLock::new(), shaper: OnceLock::new() })
 }
 
 fn db() -> &'static RwLock<Db> {
     static DB: OnceLock<RwLock<Db>> = OnceLock::new();
     DB.get_or_init(|| {
-        let mut db = Db { faces: Vec::new(), scanned: false };
-        for b in [INTER_REGULAR, INTER_MEDIUM, INTER_SEMIBOLD, INTER_BOLD, INTER_ITALIC, JETBRAINS_MONO_REGULAR, NOTO_SERIF_REGULAR] {
+        let fallback = bundled_default_face();
+        let mut db = Db { faces: vec![fallback.clone()], fallback, scanned: false };
+        for b in [INTER_MEDIUM, INTER_SEMIBOLD, INTER_BOLD, INTER_ITALIC, JETBRAINS_MONO_REGULAR, NOTO_SERIF_REGULAR] {
             for n in read_faces_bytes(b) {
                 push(&mut db, info_from(n, FaceData::Static(b), "bundled"));
             }
@@ -309,9 +386,10 @@ fn db() -> &'static RwLock<Db> {
     })
 }
 
+/// Adds a face to the database and returns its id.
 fn push(db: &mut Db, info: FaceInfo) -> FaceId {
     let id = db.faces.len();
-    db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), shaper: OnceLock::new() }));
+    db.faces.push(Arc::new(Face { id, info, bytes: OnceLock::new(), file_meta: OnceLock::new(), shaper: OnceLock::new() }));
     id
 }
 
@@ -363,12 +441,67 @@ pub fn scan_system() -> usize {
 }
 
 /// Scan the system font folders again, adding fonts installed since the last scan (faces already
-/// known are kept, so font ids stay valid). Returns the number of faces added.
+/// known are kept, so font ids stay valid). Returns the number of faces added. This walks every
+/// fontconfig directory, so the UI calls [`start_rescan`] instead of running it on the frame thread.
 pub fn rescan_system() -> usize {
     let _scan = SCAN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let n = if cfg!(target_arch = "wasm32") { 0 } else { add_source(&DirectorySource::system()) };
     db().write().unwrap_or_else(std::sync::PoisonError::into_inner).scanned = true;
     n
+}
+
+/// A rescan started by [`start_rescan`], if one is in flight or finished and not yet polled.
+#[cfg(not(target_arch = "wasm32"))]
+static RESCAN: std::sync::Mutex<Option<std::thread::JoinHandle<usize>>> = std::sync::Mutex::new(None);
+
+/// Start [`rescan_system`] on a background thread. Returns false when a rescan is already
+/// running, the thread could not be spawned, or this build has no system font folders (wasm).
+pub fn start_rescan() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut slot = RESCAN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+            return false;
+        }
+        match std::thread::Builder::new().name("font-rescan".into()).spawn(rescan_system) {
+            Ok(handle) => {
+                *slot = Some(handle);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Whether a background rescan is still walking the font folders.
+pub fn rescan_busy() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        RESCAN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+/// Faces added by the latest background rescan, once that thread has finished. `None` while it
+/// is still running or when nothing was started.
+pub fn poll_rescan() -> Option<usize> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut slot = RESCAN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let finished = slot.as_ref().is_some_and(std::thread::JoinHandle::is_finished);
+        if finished { slot.take().and_then(|h| h.join().ok()) } else { None }
+    }
 }
 
 /// Start the system font scan on a background thread, so the font menus are complete by the
@@ -394,10 +527,7 @@ pub fn system_scanned() -> bool {
 /// A face by id (panics never: unknown ids give the default face).
 pub fn face(id: FaceId) -> Arc<Face> {
     let d = db().read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // The bundled fonts are compiled in and always parse (`tests::bundled_families_and_resolution` checks them), so
-    // the database is never empty.
-    #[allow(clippy::expect_used)]
-    d.faces.get(id).or_else(|| d.faces.first()).cloned().expect("bundled fonts present")
+    d.faces.get(id).cloned().unwrap_or_else(|| d.fallback.clone())
 }
 
 /// All faces (bundled first).
@@ -688,14 +818,28 @@ const JAPANESE_FAMILIES: &[&str] = &[
 ];
 /// Han ideograph families for Simplified Chinese, in the order the platforms' own fallback tables
 /// prefer them (Windows, macOS, then the Linux/Noto names). Missing ones cost one name lookup each.
-const SIMPLIFIED_CHINESE_FAMILIES: &[&str] =
-    &["Microsoft YaHei", "SimSun", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", "WenQuanYi Micro Hei"];
+/// `Hiragino Sans GB`, `Heiti SC` and `Songti SC` are the Simplified faces a macOS install without
+/// the on-demand PingFang has (macOS 27 on an English install ships them, not PingFang): without
+/// them Chinese Han text fell through to the Japanese face and drew Japanese glyph forms (#453).
+const SIMPLIFIED_CHINESE_FAMILIES: &[&str] = &[
+    "Microsoft YaHei",
+    "SimSun",
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Heiti SC",
+    "Songti SC",
+    "STSong",
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+    "Source Han Sans SC",
+    "WenQuanYi Micro Hei",
+];
 /// The same for Traditional Chinese. The two scripts share almost all of their code points but not
 /// the glyph forms (`东` against `東`'s neighbours, `直`, `骨`), so one list for both drew a
 /// Traditional interface with Simplified forms - the faces do not differ in *coverage*, which is
 /// what the fallback search checks, so the script has to pick the list.
 const TRADITIONAL_CHINESE_FAMILIES: &[&str] =
-    &["Microsoft JhengHei", "MingLiU", "PingFang TC", "Heiti TC", "Hiragino Sans CNS", "Noto Sans CJK TC", "Noto Sans TC", "Source Han Sans TC"];
+    &["Microsoft JhengHei", "MingLiU", "PingFang TC", "Heiti TC", "Hiragino Sans CNS", "Songti TC", "Noto Sans CJK TC", "Noto Sans TC", "Source Han Sans TC"];
 const KOREAN_FAMILIES: &[&str] = &["Malgun Gothic", "Gulim", "Apple SD Gothic Neo", "Noto Sans CJK KR", "Noto Sans KR", "Source Han Sans KR", "NanumGothic"];
 /// The platforms' plain text families for the other scripts the bundled fonts lack, in the same
 /// order (Windows, macOS, then the Linux/Noto names).

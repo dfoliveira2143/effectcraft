@@ -1,15 +1,20 @@
 //! Layer ▸ Create: Convert to Editable Text (Photoshop type layers), Create Shapes from Text,
-//! Create Masks from Text and Create Shapes from Vector Layer (SVG footage).
+//! Create Masks from Text, Create Shapes from Vector Layer (SVG footage) and Create 3D Layer
+//! Instance (a 2D copy of a 3D model layer that 2D effects can be applied to).
 
 use effectcraft_color::Label;
-use effectcraft_project::{ItemKind, LayerSource, Solid};
+use effectcraft_keyframe::Value as KV;
+use effectcraft_project::build::{self, Ids};
+use effectcraft_project::{ItemKind, LayerSource, MatteKind, Solid, TrackMatte};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, has_layers, layers_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
-const OPS: &str = "editableText|shapesFromText|masksFromText|shapesFromVector";
+const OPS: &str = "editableText|shapesFromText|masksFromText|shapesFromVector|instance3d";
 
+/// Layer ▸ Create (`layer.create`): the `op` ([`OPS`]) on the given or selected layers; returns
+/// the created layer ids and what was skipped.
 fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let op = str_p(p, "op").ok_or_else(|| bad("layer.create", format!("missing `op` ({OPS})")))?;
     let (cid, lids) = layers_p(s, p)?;
@@ -19,6 +24,69 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let time = s.time();
     let mut created = vec![];
     let mut skipped = vec![];
+    // All the selected models in one edit: one undo (or redo) removes (or restores) every
+    // instance at once, as one command in the History panel.
+    if op == "instance3d" {
+        // After Effects' Create 3D Layer Instance (Layer ▸ Create): 3D model layers take
+        // no masks or effects, so a comp-sized solid goes at the top of the layer stack
+        // with a 3D Layer Instance effect referencing the model — a 2D copy of its render,
+        // through the comp's camera, that 2D effects can be applied to. The model is switched
+        // off, as After Effects does (back on to keep its shadow).
+        let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
+        let mut eligible = vec![];
+        for lid in &lids {
+            match comp.layer(*lid) {
+                Some(src) if src.source.is_model() => eligible.push((*lid, src.clone())),
+                Some(src) => skipped.push(format!("{}: not a 3D model layer", src.name)),
+                None => {}
+            }
+        }
+        if !eligible.is_empty() {
+            let ids = s.edit("Create 3D Layer Instance", None, |proj, st| {
+                let mut ids = vec![];
+                for (lid, src) in &eligible {
+                    let name = proj.comp(cid).ok_or(EngineError::NoComp)?.unique_layer_name(&format!("{} Instance", src.name));
+                    let folder = proj.folder_named("Solids").unwrap_or_else(|| proj.add_item("Solids", Label::Yellow, None, ItemKind::Folder));
+                    let sid = proj.add_item(
+                        &name,
+                        src.label,
+                        Some(folder),
+                        ItemKind::Solid(Solid { color: [1.0, 1.0, 1.0], width: comp.width, height: comp.height, pixel_aspect: 1.0 }),
+                    );
+                    let mut l = build::layer(proj, &comp, &name, LayerSource::Solid { item: sid }, (comp.width, comp.height), None);
+                    // A soloed source keeps its Solo switch with video off, and any_solo hides
+                    // the non-soloed copy: the copy takes the Solo over to stay visible.
+                    l.switches.solo = src.switches.solo;
+                    // A 3D Layer Instance effect referencing the 3D layer: the solid shows its
+                    // render (the 2D copy).
+                    let fx = effectcraft_effects::find("ec.3d.instance3d").ok_or_else(|| bad("layer.create", "the 3D Layer Instance effect is missing"))?;
+                    let mut g = effectcraft_effects::instantiate(fx, &mut Ids(&mut proj.next_id), fx.name, [comp.width as f64, comp.height as f64]);
+                    if let Some(pr) = g.get_mut("layer") {
+                        pr.value = KV::Layer(Some(lid.0));
+                    }
+                    if let Some(fxg) = l.props.sub_mut("effects") {
+                        fxg.children.push(g.into());
+                    }
+                    // The model is switched off (After Effects turns the referenced layer off);
+                    // the copies go at the top of the stack, selected.
+                    let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
+                    if let Some(m) = c.layers.iter_mut().find(|x| x.id == *lid) {
+                        m.switches.video = false;
+                    }
+                    let id = l.id;
+                    c.layers.insert(0, l);
+                    ids.push(id);
+                }
+                st.selected_layers = ids.clone();
+                Ok(ids)
+            })?;
+            created.extend(ids.iter().map(|i| i.0));
+        }
+        if created.is_empty() && !skipped.is_empty() {
+            return Err(bad("layer.create", skipped.join("; ")));
+        }
+        return Ok(json!({"layers": created, "skipped": skipped}));
+    }
     for lid in lids {
         let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
         let Some(src) = comp.layer(lid).cloned() else { continue };
@@ -33,8 +101,11 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
                     continue;
                 };
                 let bytes = s.services.read_file(&f.path).map_err(|e| EngineError::Other(format!("cannot read {}: {e}", f.path)))?;
-                let doc = crate::vector::vector_doc(&f.path, &bytes, f.layer.as_ref(), f.page)
+                // In the source layer's pixels, as the footage is drawn (a placed page of an After
+                // Effects project fills the stored size, #3099).
+                let doc = crate::vector::footage_doc(&f, &bytes)
                     .unwrap_or_else(|| Err(format!("{}: not a vector file", f.path)))
+                    .map(|d| crate::vector::fitted_to_footage(d, &f))
                     .map_err(EngineError::Other)?;
                 // Images become footage layers (PNG files written next to the source and
                 // imported), parented to the shape layer below it.
@@ -57,7 +128,7 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
                     // Without images: one shape layer. With images: the shapes between them
                     // in layers of their own, so the stack keeps the document's paint order.
                     let segments = if image_items.is_empty() { vec![doc.clone()] } else { crate::vector::split_at_images(&doc) };
-                    let top = crate::vector::shapes_from_vector(proj, &comp, &src, segments.last().unwrap_or(&doc));
+                    let mut top = crate::vector::shapes_from_vector(proj, &comp, &src, segments.last().unwrap_or(&doc));
                     // Top to bottom: the last segment, image n, segment n − 1, … image 1, segment 0.
                     let mut stack = vec![];
                     for k in (0..segments.len().saturating_sub(1)).rev() {
@@ -74,9 +145,25 @@ fn create(s: &mut Session, p: &Value) -> Result<Value> {
                         sl.name = format!("{} {}", top.name, k + 1);
                         stack.push(sl);
                     }
+                    // A placed page shows only its frame (the footage's raster ends there): every
+                    // layer made from it takes a hidden frame layer as its track matte (#3099).
+                    let matte = crate::vector::frame_matte(proj, &comp, &src, &f);
+                    if let Some(m) = &matte {
+                        let tm = Some(TrackMatte { layer: m.id, kind: MatteKind::Alpha });
+                        top.track_matte = tm;
+                        for l in &mut stack {
+                            l.track_matte = tm;
+                        }
+                    }
                     let mut ids = vec![top.id];
                     ids.extend(stack.iter().filter(|l| matches!(l.source, LayerSource::Shape)).map(|l| l.id));
-                    // Each directly above the source: the top layer first.
+                    // The frame matte is made too (last: the selection stays on the top layer).
+                    ids.extend(matte.as_ref().map(|m| m.id));
+                    // Each directly above the source: the frame matte (when there is one) above
+                    // all, then the top layer first.
+                    if let Some(m) = matte {
+                        insert_above(proj, cid, lid, m, true)?;
+                    }
                     insert_above(proj, cid, lid, top, true)?;
                     for l in stack {
                         insert_above(proj, cid, lid, l, true)?;
@@ -198,5 +285,5 @@ fn insert_above(
 }
 
 pub fn specs() -> Vec<CommandSpec> {
-    vec![cmd!("layer.create", "Create", [], None, "{op: editableText|shapesFromText|masksFromText|shapesFromVector, layers?}", has_layers, create)]
+    vec![cmd!("layer.create", "Create", [], None, "{op: editableText|shapesFromText|masksFromText|shapesFromVector|instance3d, layers?}", has_layers, create)]
 }

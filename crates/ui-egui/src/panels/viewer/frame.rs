@@ -1,4 +1,4 @@
-use super::*;
+use super::{Align2, EffectcraftApp, Pos2, Rect, Stroke, StrokeKind, Tokens, View3D, ViewerMap, json, pos2, vec2, vt, widgets};
 
 /// Draw the no-composition viewer with New Composition and New Composition From Footage buttons, accepting Project
 /// items dropped on it to create the first composition.
@@ -9,13 +9,13 @@ pub(super) fn empty_state(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rec
     let c = rect.center();
     p.text(c - vec2(0.0, 40.0), Align2::CENTER_CENTER, crate::i18n::tr("Composition"), Tokens::semibold(16.0), t.text);
     let b1 = Rect::from_center_size(c + vec2(0.0, 0.0), vec2(220.0, 30.0));
-    if widgets::text_button(ui, b1, "New Composition", true, &t, egui::Id::unique("empty-newcomp")).clicked() {
+    if widgets::text_button(ui, b1, crate::i18n::tr("New Composition"), true, &t, egui::Id::unique("empty-newcomp")).clicked() {
         crate::panels::dialogs::open_new_comp(app);
     }
     app.auto.add("viewer.empty.newComp", b1, "New Composition");
     let b2 = Rect::from_center_size(c + vec2(0.0, 40.0), vec2(220.0, 30.0));
-    if widgets::text_button(ui, b2, "New Composition From Footage", false, &t, egui::Id::unique("empty-fromfootage")).clicked() {
-        let _ = crate::menus::invoke(app, &ui.ctx().clone(), "file.import", json!({}));
+    if widgets::text_button(ui, b2, crate::i18n::tr("New Composition From Footage"), false, &t, egui::Id::unique("empty-fromfootage")).clicked() {
+        let _ = crate::menus::invoke(app, &ui.ctx().clone(), "file.import", json!({"newComp": true}));
     }
     app.auto.add("viewer.empty.import", b2, "New Composition From Footage");
     // A Project item dropped on the empty viewer creates the first composition,
@@ -25,7 +25,7 @@ pub(super) fn empty_state(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rec
     if let Some(crate::panels::DragPayload::Item(dragged)) = egui::DragAndDrop::payload::<crate::panels::DragPayload>(&ctx).as_deref()
         && ui.rect_contains_pointer(rect)
     {
-        let items: Vec<effectcraft_engine::project::ItemId> = crate::panels::project_drop_items(app, *dragged)
+        let items: Vec<effectcraft_engine::project::ItemId> = crate::panels::project_drop_items(app, *dragged, None)
             .into_iter()
             .map(effectcraft_engine::project::ItemId)
             .filter(|id| {
@@ -140,7 +140,8 @@ pub(super) fn rect_of(map: &ViewerMap, r: Option<[f64; 4]>) -> Rect {
 
 /// Put a rendered frame on screen: CPU pixels go into an egui texture, averaged down by `minify`
 /// (see [`minify_factor`]); GPU frames are drawn straight from their wgpu texture (registered with
-/// egui-wgpu, no readback).
+/// egui-wgpu, no readback). Half-float frames (32 bpc) are kept for the display pass, which
+/// `viewer_tools::draw_frame` runs (exposure, HDR step, display colour).
 pub(super) fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames::FrameKey, img: crate::frames::FrameImage, minify: usize) {
     use crate::frames::FrameImage;
     // Settings ▸ Previews ▸ Viewer Zoom Quality.
@@ -158,8 +159,18 @@ pub(super) fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: cra
                 }
                 _ => app.viewer_tex = Some((ctx.load_texture("viewer-frame", fitted, opts), key, minify)),
             }
-            app.viewer_shown = app.viewer_tex.as_ref().map(|(t, k, _)| (t.id(), *k));
+            app.viewer_shown = app.viewer_tex.as_ref().map(|(t, k, _)| (Some(t.id()), *k));
             app.viewer_image = Some(img);
+            app.viewer_f16 = None;
+            vt::set_texture_roi(ctx, app.session.state.region_of_interest.or(app.ui.viewer.extended));
+        }
+        FrameImage::CpuF16(f) => {
+            // Drawn through the display pass; the 8-bit texture of an earlier frame goes.
+            app.viewer_tex = None;
+            // No texture of its own: the display pass draws it.
+            app.viewer_shown = Some((None, key));
+            app.viewer_image = None;
+            app.viewer_f16 = Some(f);
             vt::set_texture_roi(ctx, app.session.state.region_of_interest.or(app.ui.viewer.extended));
         }
         FrameImage::Gpu(f) => {
@@ -175,9 +186,10 @@ pub(super) fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: cra
             };
             drop(ren);
             app.viewer_native = Some((id, key, f));
-            app.viewer_shown = Some((id, key));
+            app.viewer_shown = Some((Some(id), key));
             // Pixels are read back on demand (viewer_pixels).
             app.viewer_image = None;
+            app.viewer_f16 = None;
         }
     }
 }

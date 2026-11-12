@@ -34,7 +34,7 @@ fn time_stretch(s: &mut Session, p: &Value) -> Result<Value> {
     let fd = comp_rate.frame_duration();
     s.edit(if reverse { "Time-Reverse Layer" } else { "Time Stretch" }, None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             let old = l.stretch;
             if reverse {
                 // Keep the in/out points; play the visible span backwards.
@@ -59,8 +59,15 @@ fn time_stretch(s: &mut Session, p: &Value) -> Result<Value> {
                 (None, Some(d)) if span > 0.0 => old * d / span,
                 _ => old,
             };
+            if !new.is_finite() {
+                return Err(bad("layer.timeStretch", "the stretch factor must be a number"));
+            }
             if new.abs() < 1.0 {
                 return Err(bad("layer.timeStretch", "the stretch factor must be at least 1 %"));
+            }
+            // After Effects' largest stretch; a project file holds no more either (#3247).
+            if new.abs() > effectcraft_project::limits::MAX_STRETCH {
+                return Err(bad("layer.timeStretch", "the stretch factor must be at most 9900 %"));
             }
             // The hold point keeps showing the same layer time.
             let h = match hold {
@@ -109,7 +116,7 @@ fn enable_time_remap(s: &mut Session, p: &Value) -> Result<Value> {
         let mut next = proj.next_id;
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut on = false;
-        for l in comp.layers.iter_mut().filter(|l| ids.contains(&l.id) && remappable(l)) {
+        for l in comp.layers.iter_mut_where(|l| ids.contains(&l.id) && remappable(l)) {
             let has = l.props.get("timeRemap").is_some();
             let target = want.unwrap_or(!has);
             on |= target;
@@ -185,7 +192,17 @@ fn freeze(s: &mut Session, p: &Value, last: bool) -> Result<Value> {
         return Err(bad("layer.freezeFrame", "freezing needs a footage or composition layer"));
     }
     // What each layer shows now (honouring an existing remap) — evaluated before the edit.
-    let ectx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: cti, expr: s.expr.as_deref(), footage: Some(s.footage.as_ref()) };
+    let ectx = effectcraft_render::EvalCtx {
+        project: &s.project,
+        comp_id: cid,
+        comp,
+        time: cti,
+        expr: s.expr.as_deref(),
+        footage: Some(s.footage.as_ref()),
+        property_overrides: &[],
+        media_overrides: &[],
+        reads: None,
+    };
     let now: Vec<(effectcraft_project::LayerId, f64)> = comp
         .layers
         .iter()

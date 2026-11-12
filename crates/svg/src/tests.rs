@@ -221,6 +221,18 @@ fn transforms() {
 }
 
 #[test]
+fn nested_entities_are_refused_instead_of_expanding_without_bound() {
+    // #2129: each top-level `&b;` stays under roxmltree's per-reference cap but adds 12 500
+    // nodes, so 40 KB of references expands to 5 million.
+    let dtd = format!("<!ENTITY a \"{}\"><!ENTITY b \"{}\">", "<g/>".repeat(50), "&a;".repeat(250));
+    let bomb = format!("<?xml version=\"1.0\"?><!DOCTYPE svg [{dtd}]><svg xmlns=\"http://www.w3.org/2000/svg\">{}</svg>", "&b;".repeat(400));
+    assert!(matches!(crate::parse(bomb.as_bytes()), Err(crate::Error::Xml(_))));
+    // An ordinary entity, as Illustrator declares them, still parses.
+    let ok = "<?xml version=\"1.0\"?><!DOCTYPE svg [<!ENTITY w \"40\">]><svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"&w;\" height=\"5\"/></svg>";
+    assert!(crate::parse(ok.as_bytes()).is_ok());
+}
+
+#[test]
 fn deep_nesting_errors_instead_of_overflowing_the_stack() {
     // 100 000 nested groups overflowed the XML parser's stack and aborted the process.
     let deep = |n: usize| format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{}<rect width=\"5\" height=\"5\"/>{}</svg>", "<g>".repeat(n), "</g>".repeat(n));
@@ -421,4 +433,53 @@ fn font_size_percentage_resolves_against_the_parent_font_size() {
         assert_eq!(shapes.len(), 1);
         assert!(matches!(shapes[0].2.geom, Geom::Rect { w, .. } if w == expected), "{body}: {:?}", shapes[0].2.geom);
     }
+}
+
+#[test]
+fn at_rule_blocks_are_skipped_by_brace_depth() {
+    let mut sheet = StyleSheet::default();
+    parse_css("@media print { .a{fill:#ff0000} .b{fill:#0000ff} } .c{fill:red}", &mut sheet).unwrap();
+    assert_eq!(sheet.rules.len(), 1);
+    assert_eq!(sheet.rules[0].classes, vec!["c".to_string()]);
+    let mut sheet = StyleSheet::default();
+    parse_css("@media x { @supports y { .c{} } .d{} } .e{fill:red}", &mut sheet).unwrap();
+    assert_eq!(sheet.rules.len(), 1);
+    assert_eq!(sheet.rules[0].classes, vec!["e".to_string()]);
+}
+
+#[test]
+fn gradient_stops_copied_past_the_budget_are_refused() {
+    // 4,000 stops referenced by 2,100 shapes would keep 8.4 million stops.
+    let stops: String = (0..4000).map(|i| format!("<stop offset=\"{}\" stop-color=\"red\"/>", i as f64 / 4000.0)).collect();
+    let rects = "<rect width=\"1\" height=\"1\" fill=\"url(#g)\"/>".repeat(2100);
+    let svg = format!("<svg xmlns=\"http://www.w3.org/2000/svg\"><defs><linearGradient id=\"g\">{stops}</linearGradient></defs>{rects}</svg>");
+    assert!(matches!(parse(svg.as_bytes()), Err(Error::Xml(e)) if e.contains("gradients")));
+}
+
+#[test]
+fn nested_knockout_groups_stop_at_the_draw_budget() {
+    // Each knockout level draws its children twice and each non-isolated level twice more:
+    // 30 nested levels would be 4^30 draws. The draw budget ends it.
+    let mut g = Group::new("leaf");
+    g.children.push(Node::Shape(Shape {
+        name: "s".into(),
+        geom: Geom::Rect { x: 0.0, y: 0.0, w: 4.0, h: 4.0, rx: 0.0, ry: 0.0 },
+        transform: Affine::IDENTITY,
+        fill: Some(Paint::Color([1.0, 0.0, 0.0])),
+        fill_opacity: 1.0,
+        fill_rule: FillRule::NonZero,
+        stroke: None,
+        opacity: 1.0,
+    }));
+    for _ in 0..30 {
+        let mut p = Group::new("k");
+        p.knockout = true;
+        p.isolated = false;
+        p.children.push(Node::Group(g));
+        g = p;
+    }
+    let doc = Doc { width: 4.0, height: 4.0, root: g, skipped: vec![] };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(rasterize(&doc, 4, 4, 1.0).width).ok());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(20)).expect("rendering finishes"), 4);
 }

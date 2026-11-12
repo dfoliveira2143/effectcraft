@@ -299,6 +299,70 @@ fn save_dialogs_offer_the_file_extension() {
     assert_eq!(*asked.borrow(), ["project Frame.png"]);
 }
 
+/// #2788: Save As, Save a Copy (`<name> copy`) and Save a Copy As XML start from the open
+/// project's name (in its folder), not Untitled Project.
+#[test]
+fn save_as_dialogs_start_from_the_open_project() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    app.session.execute("comp.new", json!({"name": "A", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+    let ctx = egui::Context::default();
+    let dir = std::env::temp_dir().join(format!("ec-save-as-name-{}", std::process::id()));
+    let project = dir.join("Intro.ecproj");
+    app.session.path = Some(project.to_string_lossy().to_string());
+    let asked: Rc<RefCell<Vec<String>>> = Rc::default();
+    let (a, b) = (asked.clone(), asked.clone());
+    app.hooks.pick_save = Some(Box::new(move |name: &str| {
+        a.borrow_mut().push(format!("project {name}"));
+        None
+    }));
+    app.hooks.pick_save_file = Some(Box::new(move |name: &str, ext: &str| {
+        b.borrow_mut().push(format!("file {name} [{ext}]"));
+        None
+    }));
+    for id in ["file.saveAs", "file.saveCopy", "file.saveCopyAsXml"] {
+        invoke(&mut app, &ctx, id, json!({})).unwrap();
+    }
+    let xml = dir.join("Intro.ecprojx").to_string_lossy().to_string();
+    // Save a Copy names another file: it would refuse to write over the open project.
+    assert_eq!(*asked.borrow(), ["project Intro.ecproj".to_string(), "project Intro copy.ecproj".into(), format!("file {xml} [ecprojx]")]);
+    // An open XML project's XML copy is another file too.
+    app.session.path = Some(dir.join("Intro.ecprojx").to_string_lossy().to_string());
+    asked.borrow_mut().clear();
+    invoke(&mut app, &ctx, "file.saveCopyAsXml", json!({})).unwrap();
+    let copy = dir.join("Intro copy.ecprojx").to_string_lossy().to_string();
+    assert_eq!(*asked.borrow(), [format!("file {copy} [ecprojx]")]);
+    app.session.path = Some(project.to_string_lossy().to_string());
+    // The non-blocking dialog gets the whole path, so it opens in the project's folder.
+    let pending: Arc<Mutex<Vec<crate::FileDialog>>> = Arc::default();
+    let queue = pending.clone();
+    app.hooks.file_dialog_async = Some(Box::new(move |dialog, _done| queue.lock().unwrap().push(dialog)));
+    invoke(&mut app, &ctx, "file.saveAs", json!({})).unwrap();
+    let dialog = pending.lock().unwrap().pop().expect("a dialog was shown");
+    assert_eq!(dialog, crate::FileDialog::Save { default: project.to_string_lossy().to_string(), ext: "ecproj".into(), project: true });
+}
+
+/// File ▸ Scripts ▸ Recent Script Files and its key run a script again without a file dialog.
+#[test]
+fn recent_script_files_run_without_a_dialog() {
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let ctx = egui::Context::default();
+    let dir = std::env::temp_dir().join(format!("ec-recent-script-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("New Comp.jsonl");
+    std::fs::write(&script, r#"{"command": "comp.new", "params": {"name": "From Script", "width": 64, "height": 36, "frameRate": 30, "duration": 1}}"#)
+        .unwrap();
+    app.session.execute("file.runScript", json!({"path": script.to_string_lossy()})).unwrap();
+    let (m, k, id, params) =
+        bindings(&app.session).into_iter().find(|b| b.2 == "file.runScript" && b.3 == json!({"recent": 0})).expect("the most recent script has a key");
+    assert_eq!((m, k), parse_shortcut("Cmd+Alt+Shift+D").unwrap());
+    assert_eq!(invoke(&mut app, &ctx, &id, params).unwrap()["steps"], 1);
+    assert_eq!(app.session.project.items.values().filter(|i| i.name.starts_with("From Script")).count(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// #511: with a host's non-blocking dialogs, a command's file dialog opens without running
 /// a nested event loop inside the frame (a drag over the window then aborted the app on
 /// macOS); the command runs on a later frame with the answer, and a cancelled one not at all.
@@ -399,8 +463,393 @@ fn tga_is_available_in_import_replace_and_proxy_dialogs() {
     }
 }
 
+/// Cmd+W with the Render Queue focused closes the queue; the composition next to it stays
+/// open (it used to be closed, and the queue stayed).
+#[test]
+fn cmd_w_in_the_render_queue_closes_the_queue_not_the_comp() {
+    let ctx = egui::Context::default();
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let a = app.session.execute("comp.new", json!({"name": "A", "duration": 4})).unwrap()["comp"].as_u64();
+    app.show_panel(PanelKind::RenderQueue);
+    assert_eq!(app.ui.focused, PanelKind::RenderQueue);
+    invoke(&mut app, &ctx, "file.close", json!({})).unwrap();
+    assert!(!app.ui.dock.is_visible(PanelKind::RenderQueue));
+    assert_eq!(app.session.state.active_comp.map(|c| c.0), a);
+    assert_eq!(app.session.state.open_comps.len(), 1);
+    // The focus left the closed queue: the next Close closes the composition.
+    assert_ne!(app.ui.focused, PanelKind::RenderQueue);
+    invoke(&mut app, &ctx, "file.close", json!({})).unwrap();
+    assert_eq!(app.session.state.open_comps.len(), 0, "a second Close acts on the composition");
+}
+
+#[test]
+fn file_close_is_available_for_an_empty_render_queue_without_a_comp() {
+    for params in [Value::Null, json!({})] {
+        let ctx = egui::Context::default();
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        assert!(app.session.active_comp().is_none());
+        app.show_panel(PanelKind::RenderQueue);
+        assert!(menu_items(&app).iter().find(|item| item.id == "file.close").unwrap().enabled);
+        invoke(&mut app, &ctx, "file.close", params).unwrap();
+        assert!(!app.ui.dock.is_open(PanelKind::RenderQueue));
+    }
+}
+
+#[test]
+fn closing_the_render_queue_reveals_the_panel_receiving_focus() {
+    for maximized in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.close_panel(PanelKind::Timeline);
+        app.close_panel(PanelKind::Composition);
+        app.show_panel(PanelKind::EffectControls);
+        assert!(!app.ui.dock.is_visible(PanelKind::Project));
+        app.show_panel(PanelKind::RenderQueue);
+        if maximized {
+            app.apply_dock(craft_ui::docking::Action::Float { panel: PanelKind::RenderQueue, rect: [50.0, 60.0, 400.0, 200.0] }).unwrap();
+            app.toggle_maximize(PanelKind::EffectControls);
+            app.ui.focused = PanelKind::RenderQueue;
+            assert!(app.ui.dock.is_floating(PanelKind::RenderQueue));
+        }
+        invoke(&mut app, &ctx, "file.close", json!({})).unwrap();
+        assert_eq!(app.ui.focused, PanelKind::Project);
+        assert!(app.ui.dock.is_visible(app.ui.focused), "focus must belong to a front tab");
+        assert_eq!(app.ui.maximized, None, "the focused docked panel must be on screen");
+    }
+}
+
+/// Closing a floating queue must focus the viewer that is actually shown, retaining maximization.
+#[test]
+fn closing_a_floating_queue_preserves_the_maximized_composition() {
+    let mut session = effectcraft_engine::Session::default();
+    session.execute("comp.new", json!({"name": "A", "width": 32, "height": 32, "duration": 2})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(|_| EffectcraftApp::new(session));
+    h.run_steps(3);
+    let ctx = h.ctx.clone();
+    let app = h.state_mut();
+    app.show_panel(PanelKind::Composition);
+    app.show_panel(PanelKind::RenderQueue);
+    app.apply_dock(craft_ui::docking::Action::Float { panel: PanelKind::RenderQueue, rect: [50.0, 60.0, 400.0, 200.0] }).unwrap();
+    app.toggle_maximize(PanelKind::Composition);
+    app.ui.focused = PanelKind::RenderQueue;
+    assert!(app.ui.dock.is_visible(PanelKind::Timeline), "the hidden underlying tab triggers the regression");
+    assert!(!panel_shown(app, PanelKind::Timeline));
+    invoke(app, &ctx, "file.close", json!({})).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.focused, PanelKind::Composition);
+    assert_eq!(h.state().ui.maximized, Some(PanelKind::Composition));
+    assert!(!h.state().ui.dock.is_open(PanelKind::RenderQueue));
+    assert_eq!(h.state().session.state.open_comps.len(), 1);
+}
+
+#[test]
+fn queue_close_preserves_state_when_workspace_is_locked() {
+    let ctx = egui::Context::default();
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    app.session.execute("comp.new", json!({"name": "A", "duration": 2})).unwrap();
+    app.show_panel(PanelKind::RenderQueue);
+    app.ui.dock.locked = true;
+    let workspace = app.ui.dock.clone();
+    let comp = app.session.active_comp_id();
+    for _ in 0..2 {
+        assert!(invoke(&mut app, &ctx, "file.close", Value::Null).is_err());
+        assert_eq!(app.ui.dock, workspace);
+        assert_eq!(app.ui.focused, PanelKind::RenderQueue);
+        assert_eq!(app.session.active_comp_id(), comp);
+    }
+    assert!(!menu_items(&app).iter().find(|item| item.id == "file.close").unwrap().enabled);
+    app.ui.dock.locked = false;
+    invoke(&mut app, &ctx, "file.close", Value::Null).unwrap();
+    assert!(!app.ui.dock.is_open(PanelKind::RenderQueue));
+}
+
+#[test]
+fn queue_close_preserves_viewer_command_target() {
+    let ctx = egui::Context::default();
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let a = app.session.execute("comp.new", json!({"name": "A", "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+    let b = app.session.execute("comp.new", json!({"name": "B", "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+    app.show_panel(PanelKind::Viewer(1));
+    app.ui.viewers.insert(0, Some(a));
+    app.ui.viewers.insert(1, Some(b));
+    app.ui.active_viewer = 1;
+    app.apply_dock(craft_ui::docking::Action::Move {
+        panel: PanelKind::Timeline,
+        anchor: PanelKind::Composition,
+        placement: craft_ui::docking::Placement::Tab { before: None },
+    })
+    .unwrap();
+    app.close_panel(PanelKind::Timeline);
+    app.show_panel(PanelKind::Composition);
+    app.show_panel(PanelKind::RenderQueue);
+    assert_eq!(app.session.active_comp_id().map(|id| id.0), Some(b));
+    invoke(&mut app, &ctx, "file.close", json!({})).unwrap();
+    assert_eq!(app.ui.focused, PanelKind::Composition);
+    assert_eq!(app.ui.active_viewer, 0);
+    assert_eq!(app.session.active_comp_id().map(|id| id.0), Some(a));
+    invoke(&mut app, &ctx, "file.close", json!({})).unwrap();
+    assert!(!app.session.state.open_comps.iter().any(|id| id.0 == a));
+    assert!(app.session.state.open_comps.iter().any(|id| id.0 == b));
+}
+
+#[test]
+fn queue_close_keeps_passive_viewer_focus_across_frames() {
+    let mut session = effectcraft_engine::Session::default();
+    let a = session.execute("comp.new", json!({"name": "A", "width": 32, "height": 32, "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+    let b = session.execute("comp.new", json!({"name": "B", "width": 32, "height": 32, "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(|_| EffectcraftApp::new(session));
+    h.run_steps(3);
+    let ctx = h.ctx.clone();
+    let app = h.state_mut();
+    app.show_panel(PanelKind::Viewer(1));
+    app.ui.viewers.insert(0, Some(a));
+    app.ui.viewers.insert(1, Some(b));
+    app.ui.active_viewer = 1;
+    app.apply_dock(craft_ui::docking::Action::Move {
+        panel: PanelKind::Timeline,
+        anchor: PanelKind::Composition,
+        placement: craft_ui::docking::Placement::Tab { before: None },
+    })
+    .unwrap();
+    app.close_panel(PanelKind::Timeline);
+    app.show_panel(PanelKind::Composition);
+    app.show_panel(PanelKind::RenderQueue);
+    invoke(app, &ctx, "file.close", Value::Null).unwrap();
+    h.run_steps(4);
+    let app = h.state_mut();
+    assert_eq!(app.ui.focused, PanelKind::Composition);
+    assert_eq!(app.ui.active_viewer, 0);
+    assert_eq!(app.session.active_comp_id().map(|id| id.0), Some(a));
+    assert!(app.ui.dock.is_visible(PanelKind::Composition));
+    assert!(!app.ui.dock.is_open(PanelKind::RenderQueue));
+    invoke(app, &ctx, "file.close", json!({})).unwrap();
+    assert!(!app.session.state.open_comps.iter().any(|id| id.0 == a));
+    assert!(app.session.state.open_comps.iter().any(|id| id.0 == b));
+    // A later explicit Open still routes normally, rather than inheriting a deferred focus override.
+    invoke(app, &ctx, "comp.open", json!({"comp": b})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().ui.dock.is_visible(PanelKind::Timeline));
+    assert_eq!(h.state().session.active_comp_id().map(|id| id.0), Some(b));
+}
+
 #[test]
 fn menu_items_cover_the_tree() {
     assert_eq!(menus().last(), Some(&"Help"));
     assert!(effectcraft_engine::menus::entries().len() > 500);
+}
+
+/// A command run from the menu that opens a composition (File ▸ Import ▸ After Effects
+/// Project… after Import Anyway, a new composition) leaves the Home screen: it stayed over the
+/// imported project, which looked as if nothing was imported. A command that opens none keeps it.
+#[test]
+fn a_menu_command_that_opens_a_composition_leaves_the_home_screen() {
+    let ctx = egui::Context::default();
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    app.ui.start_screen = true;
+    run_engine(&mut app, &ctx, "project.summary", json!({})).unwrap();
+    assert!(app.ui.start_screen);
+    assert!(run_engine(&mut app, &ctx, "file.importAep", json!({"path": "/no/such/file.aep", "allowLosses": true})).is_err());
+    assert!(app.ui.start_screen);
+    run_engine(&mut app, &ctx, "comp.new", json!({"name": "Opened", "width": 64, "height": 36, "duration": 1})).unwrap();
+    assert!(!app.ui.start_screen);
+    // Asked for again (Home button, Help ▸ In-App Tutorials) it stays while the comp is open.
+    app.ui.start_screen = true;
+    run_engine(&mut app, &ctx, "layer.newSolid", json!({"color": "#ff0000"})).unwrap();
+    assert!(app.ui.start_screen);
+}
+
+/// Opening a project leaves the Home screen also when its composition has the id of the one open
+/// before (the project changed, the id did not), from the menu and from a file dialog's answer.
+#[test]
+fn opening_a_project_leaves_the_home_screen_whatever_its_composition_id() {
+    let ctx = egui::Context::default();
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    app.session.execute("comp.new", json!({"name": "Saved", "width": 64, "height": 36, "duration": 1})).unwrap();
+    let dir = std::env::temp_dir().join(format!("ec-home-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Home.ecproj").to_string_lossy().to_string();
+    app.session.execute("file.saveAs", json!({"path": path})).unwrap();
+    let comp = app.session.active_comp_id();
+    // File ▸ Open with the path given (the menu path, `run_engine`).
+    app.ui.start_screen = true;
+    run_engine(&mut app, &ctx, "file.open", json!({"path": path})).unwrap();
+    assert_eq!(app.session.active_comp_id(), comp, "the same composition id");
+    assert!(!app.ui.start_screen, "File ▸ Open leaves the Home screen");
+    // The path picked in a file dialog (`run_with_picked`).
+    app.ui.start_screen = true;
+    super::frontend::dialog_answered(&mut app, crate::DialogAnswer { command: "file.open".into(), key: "path", params: json!({}), paths: vec![path.clone()] });
+    assert_eq!(app.session.active_comp_id(), comp);
+    assert!(!app.ui.start_screen, "a picked project leaves the Home screen");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A successful command that reports per-item problems (`errors`) shows a compact, readable
+/// report in the status line: `file: error; …`, first three and a count, never raw JSON.
+#[test]
+fn bundle_result_errors_show_compactly_in_the_status_line() {
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let result = json!({"installed": [], "errors": [
+        {"file": "a.wasm", "error": "already installed"},
+        {"file": "b.wasm", "error": "does not load"},
+        {"file": "c.wasm", "error": "cannot read it"},
+        {"error": "cannot read the bundle folder"},
+    ]});
+    super::frontend::show_result_errors(&mut app, &result);
+    assert_eq!(app.ui.status, "a.wasm: already installed; b.wasm: does not load; c.wasm: cannot read it; +1 more");
+    // A clean success leaves the status line alone.
+    super::frontend::show_result_errors(&mut app, &json!({"installed": ["x.wasm"], "errors": []}));
+    assert_eq!(app.ui.status, "a.wasm: already installed; b.wasm: does not load; c.wasm: cannot read it; +1 more");
+}
+
+/// Effect ▸ Install Effect Plug-in… picks its dialog by params: a bundle asks for a folder,
+/// a plain install asks for a `.wasm`, and with both given inline nothing asks at all.
+#[test]
+fn effect_plugin_install_dialog_router() {
+    use std::sync::{Arc, Mutex};
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let ctx = egui::Context::default();
+    let pending = Arc::new(Mutex::new(Vec::new()));
+    let queue = pending.clone();
+    app.hooks.file_dialog_async = Some(Box::new(move |dialog, _done| queue.lock().unwrap().push(dialog)));
+    // The bundle menu entry: a folder picker.
+    assert_eq!(invoke(&mut app, &ctx, "effect.plugins.install", json!({"bundle": true})).unwrap(), json!({"dialog": "effect.plugins.install"}));
+    assert_eq!(pending.lock().unwrap().pop().unwrap(), crate::FileDialog::Folder, "the bundle asks for a folder");
+    // The plain command: a `.wasm` file picker.
+    assert_eq!(invoke(&mut app, &ctx, "effect.plugins.install", json!({})).unwrap(), json!({"dialog": "effect.plugins.install"}));
+    let crate::FileDialog::Open { exts, many } = pending.lock().unwrap().pop().unwrap() else { panic!("not an open dialog") };
+    assert_eq!(exts, vec!["wasm".to_string()], "{exts:?}");
+    assert!(!many);
+    // `path` given inline overrides the bundle ask: the command runs directly, opening no dialog
+    // (this session has no plug-in loader, so it errors — but nothing was asked).
+    let r = invoke(&mut app, &ctx, "effect.plugins.install", json!({"bundle": true, "path": "x.wasm"}));
+    assert!(r.is_err(), "{r:?}");
+    assert!(pending.lock().unwrap().is_empty(), "no dialog for an inline path");
+    // A supplied `folder` is a bundle source too: asking for a file would let the install take
+    // the picked file and ignore the folder, so nothing is asked.
+    let r = invoke(&mut app, &ctx, "effect.plugins.install", json!({"folder": "some/where"}));
+    assert!(r.is_err(), "{r:?}");
+    assert!(pending.lock().unwrap().is_empty(), "no dialog for an inline folder");
+}
+
+/// File ▸ Import ▸ File… in the non-blocking dialog (macOS, Linux) offers After Effects projects
+/// next to footage, and a picked one imports as File ▸ Import ▸ Adobe After Effects Project… does: its
+/// folder, its composition open.
+#[test]
+fn import_file_dialog_offers_and_imports_after_effects_projects() {
+    use std::sync::{Arc, Mutex};
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let ctx = egui::Context::default();
+    let dir = std::env::temp_dir().join(format!("ec-import-aep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let aep = dir.join("Intro.aep").to_string_lossy().to_string();
+    let mut source = effectcraft_engine::Session::default();
+    source.execute("comp.new", json!({"name": "Intro", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+    source.execute("file.exportAep", json!({"path": aep, "allowLosses": true})).unwrap();
+
+    let pending: Arc<Mutex<Vec<crate::FileDialog>>> = Arc::default();
+    let queue = pending.clone();
+    app.hooks.file_dialog_async = Some(Box::new(move |dialog, _done| queue.lock().unwrap().push(dialog)));
+    invoke(&mut app, &ctx, "file.import", json!({})).unwrap();
+    let Some(crate::FileDialog::Open { exts, many }) = pending.lock().unwrap().pop() else { panic!("an Open dialog was shown") };
+    assert!(many && exts.iter().any(|e| e == "aep") && exts.iter().any(|e| e == "aepx"), "{exts:?}");
+    assert!(exts.iter().any(|e| e == "png"), "footage too");
+
+    super::frontend::dialog_answered(&mut app, crate::DialogAnswer { command: "file.import".into(), key: "paths", params: json!({}), paths: vec![aep] });
+    let comp = app.session.project.item(app.session.active_comp_id().expect("a composition is open")).unwrap();
+    assert_eq!(comp.name, "Intro");
+    assert_eq!(app.session.project.item(comp.parent.expect("in a folder")).unwrap().name, "Intro.aep");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Footage with unlabeled alpha asks how to interpret it (Interpret Unlabeled Alpha As: Ask
+/// User), but not over a dialog that already waits (the After Effects losses prompt of the same
+/// drop, which a background import can finish behind): that dialog stays, and a note says where
+/// to choose the interpretation.
+#[test]
+fn the_unlabeled_alpha_question_does_not_replace_an_open_dialog() {
+    use effectcraft_engine::project::{Footage, FootageKind, ItemKind};
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let ctx = egui::Context::default();
+    let footage = Footage { path: "/m/matte.tga".into(), kind: FootageKind::Still, width: 4, height: 4, has_video: true, ..Default::default() };
+    let item = std::sync::Arc::make_mut(&mut app.session.project).add_item("matte.tga", Default::default(), None, ItemKind::Footage(footage)).0;
+    app.dialog = Some(crate::Dialog::AepLosses);
+    super::frontend(&mut app, &ctx, "file.interpretFootage", json!({"item": item, "reason": "unlabeledAlpha"})).unwrap();
+    assert_eq!(app.dialog, Some(crate::Dialog::AepLosses), "the waiting dialog stays");
+    assert!(app.ui.status.contains("Interpret Footage"), "{}", app.ui.status);
+    assert!(app.session.state.project_selection.is_empty(), "the selection is left alone");
+
+    app.dialog = None;
+    super::frontend(&mut app, &ctx, "file.interpretFootage", json!({"item": item, "reason": "unlabeledAlpha"})).unwrap();
+    assert_eq!(app.dialog, Some(crate::Dialog::Form), "with no dialog open it asks");
+}
+
+/// File ▸ Import ▸ File… and Multiple Files… offer projects next to footage; File ▸ Replace
+/// Footage offers footage only.
+#[test]
+fn only_the_import_dialogs_offer_projects() {
+    use std::sync::{Arc, Mutex};
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let pending: Arc<Mutex<Vec<crate::FileDialog>>> = Arc::default();
+    let queue = pending.clone();
+    app.hooks.file_dialog_async = Some(Box::new(move |dialog, _done| queue.lock().unwrap().push(dialog)));
+    let projects = ["aep", "aepx", "ecproj", "ecprojx"];
+    for (id, offered) in [("file.import", true), ("file.importMultiple", true), ("file.replaceFootage", false)] {
+        assert!(super::frontend::file_dialog(&mut app, id, &json!({})).is_some(), "{id} asks for a file");
+        let Some(crate::FileDialog::Open { exts, .. }) = pending.lock().unwrap().pop() else { panic!("{id}: an Open dialog") };
+        assert!(exts.iter().any(|e| e == "png"), "{id} offers footage");
+        assert_eq!(projects.iter().all(|p| exts.iter().any(|e| e == p)), offered, "{id}: {exts:?}");
+        assert!(offered || !projects.iter().any(|p| exts.iter().any(|e| e == p)), "{id} offers no project: {exts:?}");
+    }
+}
+
+/// Picked After Effects projects that cannot be imported keep their errors next to the other
+/// files': a broken `.aep` and a broken `.ecproj` are both named in the status line.
+#[test]
+fn picked_projects_report_every_error() {
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let dir = std::env::temp_dir().join(format!("ec-picked-errors-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let aep = dir.join("broken.aep");
+    let ecproj = dir.join("broken.ecproj");
+    std::fs::write(&aep, b"not an aep").unwrap();
+    std::fs::write(&ecproj, b"not a project").unwrap();
+    let paths = vec![aep.to_string_lossy().to_string(), ecproj.to_string_lossy().to_string()];
+    super::frontend::dialog_answered(&mut app, crate::DialogAnswer { command: "file.import".into(), key: "paths", params: json!({}), paths: paths.clone() });
+    let status = &app.ui.status;
+    assert!(status.contains("broken.aep") && status.contains("broken.ecproj"), "{status}");
+    assert!(!status.contains('"'), "messages, not quoted JSON: {status}");
+    assert!(app.dialog.is_none() && app.session.project.items.is_empty());
+
+    // The blocking dialog (Windows), whose callers drop the result: the status line still has both.
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let ctx = egui::Context::default();
+    app.hooks.pick_files = Some(Box::new(move |_: &[&str]| paths.clone()));
+    let _ = invoke(&mut app, &ctx, "file.import", json!({}));
+    let status = &app.ui.status;
+    assert!(status.contains("broken.aep") && status.contains("broken.ecproj"), "{status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A picked After Effects project with parts that cannot come over asks first; one picked with
+/// it waits for the answer.
+#[test]
+fn a_picked_project_with_losses_asks_and_the_next_waits() {
+    let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+    let dir = std::env::temp_dir().join(format!("ec-picked-losses-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lossy = dir.join("Synthetic.aep");
+    std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/../aep/tests/fixtures/synthetic.aep"), &lossy).unwrap();
+    let intro = dir.join("Intro.aep").to_string_lossy().to_string();
+    let mut source = effectcraft_engine::Session::default();
+    source.execute("comp.new", json!({"name": "Intro", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+    source.execute("file.exportAep", json!({"path": intro, "allowLosses": true})).unwrap();
+    let paths = vec![lossy.to_string_lossy().to_string(), intro.clone()];
+    super::frontend::dialog_answered(&mut app, crate::DialogAnswer { command: "file.import".into(), key: "paths", params: json!({}), paths });
+    assert_eq!(app.dialog, Some(crate::Dialog::AepLosses));
+    assert_eq!(app.dialog_state.aep_losses.queue, [intro]);
+    assert!(app.session.project.items.is_empty(), "nothing imported before the answer");
+    let _ = std::fs::remove_dir_all(&dir);
 }

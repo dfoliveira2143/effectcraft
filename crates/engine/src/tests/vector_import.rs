@@ -2,7 +2,7 @@
 
 use effectcraft_color::BlendMode;
 use effectcraft_keyframe::Value as KV;
-use effectcraft_project::{ItemKind, LayerSource, MaskMode};
+use effectcraft_project::{Comp, ItemKind, Layer, LayerSource, MaskMode};
 use effectcraft_psd::write::*;
 use effectcraft_psd::{DValue, Descriptor, Rect};
 use serde_json::json;
@@ -74,22 +74,8 @@ pub(crate) fn sample_psd() -> Vec<u8> {
     write(&d)
 }
 
-#[test]
-fn psd_imports_as_composition() {
-    let path = tmp("sample.psd");
-    std::fs::write(&path, sample_psd()).unwrap();
-    let mut s = Session::default();
-    let r = s.execute_checked("file.import", json!({"paths": [path], "importAs": "composition"})).unwrap();
-    assert_eq!(r["errors"], json!([]), "{r}");
-    let cid = effectcraft_project::ItemId(r["comps"][0].as_u64().unwrap());
-    assert_eq!(s.state.active_comp, Some(cid));
-    assert_eq!(s.project.item(cid).unwrap().name, "sample");
-    let c = s.project.comp(cid).unwrap().clone();
-    assert_eq!((c.width, c.height), (120, 80));
-    let names: Vec<&str> = c.layers.iter().map(|l| l.name.as_str()).collect();
-    assert_eq!(names, ["Title", "Hue Shift", "Vector Masked", "Clipped", "Base", "Group A", "Background"]);
-    // Text layer: editable text, positioned at the type origin.
-    let title = &c.layers[0];
+/// Text layer: editable text, positioned at the type origin.
+fn assert_title_layer(title: &Layer) {
     assert!(matches!(title.source, LayerSource::Text));
     let Some(KV::Text(doc)) = title.props.prop("text/sourceText").map(|p| p.value.clone()) else { panic!("text") };
     assert_eq!(doc.text, "Hello PSD");
@@ -97,14 +83,18 @@ fn psd_imports_as_composition() {
     assert_eq!(doc.font, "Inter");
     assert_eq!(doc.style, "Bold");
     assert_eq!(title.props.prop("transform/position").unwrap().value.as_vec2(), [8.0, 70.0]);
-    // Adjustment layer with Hue/Saturation.
-    let hue = &c.layers[1];
+}
+
+/// Adjustment layer with Hue/Saturation.
+fn assert_hue_layer(hue: &Layer) {
     assert!(hue.switches.adjustment);
     let fx = hue.effects().unwrap().groups().next().unwrap();
     assert_eq!(fx.get("hue").unwrap().value.as_f64(), 40.0);
     assert_eq!(fx.get("saturation").unwrap().value.as_f64(), 10.0);
-    // Vector mask → mask; Stroke style.
-    let vm = &c.layers[2];
+}
+
+/// Vector mask → mask; Stroke style.
+fn assert_vector_mask_layer(vm: &Layer) {
     let m = vm.masks().unwrap().groups().next().unwrap();
     assert!(matches!(m.kind, effectcraft_project::GroupKind::Mask { mode: MaskMode::Add, .. }));
     let Some(KV::Path(p)) = m.get("path").map(|p| p.value.clone()) else { panic!("mask path") };
@@ -113,19 +103,23 @@ fn psd_imports_as_composition() {
     let st = vm.props.group("layerStyles/stroke").unwrap();
     assert_eq!(st.get("size").unwrap().value.as_f64(), 2.0);
     assert_eq!(st.get("position").unwrap().value, KV::Enum(1));
-    // Clipped → preserve transparency; opacity and blend mode.
+}
+
+/// Clipped → preserve transparency (opacity, blend mode); drop shadow.
+fn assert_clipped_and_shadow(c: &Comp) {
     let clipped = &c.layers[3];
     assert!(clipped.preserve_transparency);
     assert_eq!(clipped.blend_mode, BlendMode::Screen);
     assert!((clipped.props.prop("transform/opacity").unwrap().value.as_f64() - 128.0 / 255.0 * 100.0).abs() < 1e-9);
-    // Drop shadow.
     let ds = c.layers[4].props.group("layerStyles/dropShadow").unwrap();
     assert_eq!(ds.get("distance").unwrap().value.as_f64(), 9.0);
     assert_eq!(ds.get("angle").unwrap().value.as_f64(), 45.0);
     assert_eq!(ds.get("useGlobalLight").unwrap().value, KV::Bool(false));
     assert_eq!(ds.get("opacity").unwrap().value.as_f64(), 60.0);
-    // Group → collapsed precomp (pass through) with its layers.
-    let g = &c.layers[5];
+}
+
+/// Group → collapsed precomp (pass through) with its layers; footage items name their Photoshop layer.
+fn assert_group_precomp(s: &Session, g: &Layer) {
     assert!(g.switches.collapse);
     let LayerSource::Comp { item } = g.source else { panic!("precomp") };
     let inner = s.project.comp(item).unwrap();
@@ -140,9 +134,61 @@ fn psd_imports_as_composition() {
     assert_eq!((sl.name.as_str(), sl.layer_size), ("Masked Square", false));
     assert_eq!((f.width, f.height), (120, 80));
     assert_eq!(s.project.item(item).unwrap().name, "Masked Square/sample.psd");
+}
+
+#[test]
+fn psd_imports_as_composition() {
+    let path = tmp("sample.psd");
+    std::fs::write(&path, sample_psd()).unwrap();
+    let mut s = Session::default();
+    let r = s.execute_checked("file.import", json!({"paths": [path], "importAs": "composition"})).unwrap();
+    assert_eq!(r["errors"], json!([]), "{r}");
+    let cid = effectcraft_project::ItemId(r["comps"][0].as_u64().unwrap());
+    assert_eq!(s.state.active_comp, Some(cid));
+    assert_eq!(s.project.item(cid).unwrap().name, "sample");
+    let c = s.project.comp(cid).unwrap().clone();
+    assert_eq!((c.width, c.height), (120, 80));
+    let names: Vec<&str> = c.layers.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Title", "Hue Shift", "Vector Masked", "Clipped", "Base", "Group A", "Background"]);
+    assert_title_layer(&c.layers[0]);
+    assert_hue_layer(&c.layers[1]);
+    assert_vector_mask_layer(&c.layers[2]);
+    assert_clipped_and_shadow(&c);
+    assert_group_precomp(&s, &c.layers[5]);
     // One undo step removes everything.
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.project.comp(cid).is_none());
+}
+
+/// #2573: New Composition From Footage on a Photoshop file imported as a composition opens that
+/// composition; it isn't wrapped in another.
+#[test]
+fn psd_imported_as_composition_with_new_comp_is_the_new_comp() {
+    let path = tmp("newcomp.psd");
+    std::fs::write(&path, sample_psd()).unwrap();
+    let mut s = Session::default();
+    let r = s.execute_checked("file.import", json!({"paths": [path], "importAs": "composition", "newComp": true})).unwrap();
+    assert_eq!(r["errors"], json!([]), "{r}");
+    let cid = effectcraft_project::ItemId(r["comps"][0].as_u64().unwrap());
+    assert_eq!(s.state.active_comp, Some(cid));
+    let roots = s.project.items.values().filter(|i| matches!(i.kind, ItemKind::Comp(_)) && i.name.starts_with("newcomp")).count();
+    assert_eq!(roots, 1, "no wrapper comp");
+}
+
+/// A Photoshop file imported as a composition and dropped on the Timeline (`addToComp`) adds
+/// its composition once, not its folder too.
+#[test]
+fn psd_imported_as_composition_into_a_comp_adds_one_layer() {
+    let path = tmp("dropped.psd");
+    std::fs::write(&path, sample_psd()).unwrap();
+    let mut s = Session::default();
+    let main = s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 4})).unwrap()["comp"].as_u64().unwrap();
+    let r = s.execute_checked("file.import", json!({"paths": [path], "importAs": "composition", "addToComp": true})).unwrap();
+    assert_eq!(r["errors"], json!([]), "{r}");
+    let psd = r["comps"][0].as_u64().unwrap();
+    let layers = &s.project.comp(effectcraft_project::ItemId(main)).unwrap().layers;
+    assert_eq!(layers.len(), 1, "{layers:?}");
+    assert!(matches!(layers[0].source, LayerSource::Comp { item } if item.0 == psd));
 }
 
 #[test]
@@ -275,6 +321,41 @@ fn paste_svg_markup_as_a_shape_layer() {
 }
 
 #[test]
+fn pasted_svg_pattern_keeps_geometry_and_editable_fallback_paint() {
+    let (mut s, _) = text_session();
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
+        <defs><pattern id="p" patternUnits="userSpaceOnUse" width="4" height="4">
+            <circle cx="2" cy="2" r="1" fill="red"/>
+        </pattern></defs>
+        <rect id="patterned" width="16" height="6" fill="url(#p) rgba(255, 0, 0, 0.5)"/>
+        <path id="patterned-stroke" d="M0 8 H16" fill="none" stroke="url(#p) rgba(0, 0, 255, 0.25)" stroke-width="2"/>
+        <rect id="patterned-no-fallback" y="10" width="16" height="6" fill="url(#p)"/>
+        <path id="patterned-stroke-no-fallback" d="M0 15 H16" fill="none" stroke="url(#p)" stroke-width="2"/>
+    </svg>"##;
+    let result = s.execute_checked("edit.pasteSvg", json!({"svg": svg})).unwrap();
+    let layer_id = effectcraft_project::LayerId(result["layer"].as_u64().unwrap());
+    let layer = s.active_comp().unwrap().layer(layer_id).unwrap();
+    let shape = layer.props.sub("contents").unwrap().groups().find(|g| g.name == "patterned").unwrap();
+    let items: Vec<_> = shape.sub("contents").unwrap().groups().collect();
+    assert!(items.iter().any(|item| item.match_id == "rect"), "the editable geometry remains");
+    let fill = items.iter().find(|item| item.match_id == "fill").expect("fallback fill remains editable");
+    assert_eq!(fill.get("color").unwrap().value, KV::Color([1.0, 0.0, 0.0, 0.5]));
+    let stroke = layer.props.sub("contents").unwrap().groups().find(|g| g.name == "patterned-stroke").unwrap();
+    let items: Vec<_> = stroke.sub("contents").unwrap().groups().collect();
+    assert!(items.iter().any(|item| item.match_id == "path"), "the editable stroke path remains");
+    let stroke = items.iter().find(|item| item.match_id == "stroke").expect("fallback stroke remains editable");
+    assert_eq!(stroke.get("color").unwrap().value, KV::Color([0.0, 0.0, 1.0, 0.25]));
+    let no_fallback = layer.props.sub("contents").unwrap().groups().find(|g| g.name == "patterned-no-fallback").unwrap();
+    let items: Vec<_> = no_fallback.sub("contents").unwrap().groups().collect();
+    assert!(items.iter().any(|item| item.match_id == "rect"), "the editable geometry remains without a fallback");
+    assert!(!items.iter().any(|item| item.match_id == "fill"), "pattern paint without a fallback is omitted");
+    let no_fallback_stroke = layer.props.sub("contents").unwrap().groups().find(|g| g.name == "patterned-stroke-no-fallback").unwrap();
+    let items: Vec<_> = no_fallback_stroke.sub("contents").unwrap().groups().collect();
+    assert!(items.iter().any(|item| item.match_id == "path"), "the editable stroke geometry remains without a fallback");
+    assert!(!items.iter().any(|item| item.match_id == "stroke"), "pattern stroke without a fallback is omitted");
+}
+
+#[test]
 fn paste_svg_rejects_text_that_is_not_usable_svg() {
     let (mut s, _) = text_session();
     for bad in ["hello", "<svg", "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>", "<html><svg></html>"] {
@@ -336,4 +417,59 @@ fn psd_with_damaged_layer_section_imports_the_flattened_image() {
     let LayerSource::Footage { item } = c.layers[0].source else { panic!("footage") };
     let ItemKind::Footage(f) = &s.project.item(item).unwrap().kind else { panic!() };
     assert!(f.layer.is_none(), "the merged image, not a Photoshop layer");
+}
+
+/// A vector footage thumbnail is drawn at the thumbnail's size, never at its declared size.
+#[test]
+fn vector_footage_thumbnails_are_drawn_at_thumbnail_size() {
+    use std::sync::{Arc, Mutex};
+
+    use effectcraft_project::{Footage, ItemId};
+    use effectcraft_raster::Image;
+    use effectcraft_time::Tick;
+
+    struct Vector(Mutex<Vec<f64>>);
+    impl crate::render::FootageSource for Vector {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            panic!("the full-size frame was decoded");
+        }
+        fn vector_frame(&self, _: ItemId, f: &Footage, scale: f64) -> Option<Arc<Image>> {
+            self.0.lock().unwrap().push(scale);
+            Some(Arc::new(Image::new((f.width as f64 * scale).ceil() as u32, (f.height as f64 * scale).ceil() as u32)))
+        }
+    }
+    let source = Arc::new(Vector(Mutex::new(vec![])));
+    let mut s = Session { footage: source.clone(), ..Default::default() };
+    let f = Footage { path: "/m/huge.svg".into(), codec: "SVG".into(), width: 16_000, height: 8_000, has_video: true, ..Default::default() };
+    let item = std::sync::Arc::make_mut(&mut s.project).add_item("huge.svg", effectcraft_color::Label::Sandstone, None, ItemKind::Footage(f));
+    let (w, h, _) = (s.thumbnail_job(item, Tick::ZERO, 64).unwrap())().unwrap();
+    assert_eq!((w, h), (64, 32));
+    assert_eq!(*source.0.lock().unwrap(), [64.0 / 16_000.0]);
+}
+
+/// A vector footage thumbnail whose drawn size is a pixel over the requested one is shrunk by
+/// that pixel, not halved by an integer step.
+#[test]
+fn a_vector_thumbnail_one_pixel_over_is_not_halved() {
+    use std::sync::Arc;
+
+    use effectcraft_project::{Footage, ItemId};
+    use effectcraft_raster::Image;
+    use effectcraft_time::Tick;
+
+    struct Over;
+    impl crate::render::FootageSource for Over {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn vector_frame(&self, _: ItemId, _: &Footage, _: f64) -> Option<Arc<Image>> {
+            Some(Arc::new(Image::new(64, 64)))
+        }
+    }
+    let mut s = Session { footage: Arc::new(Over), ..Default::default() };
+    let f = Footage { path: "/m/sq.svg".into(), codec: "SVG".into(), width: 121, height: 121, has_video: true, ..Default::default() };
+    let item = std::sync::Arc::make_mut(&mut s.project).add_item("sq.svg", effectcraft_color::Label::Sandstone, None, ItemKind::Footage(f));
+    let (w, h, px) = (s.thumbnail_job(item, Tick::ZERO, 63).unwrap())().unwrap();
+    assert_eq!((w, h), (63, 63));
+    assert_eq!(px.len(), 63 * 63 * 4);
 }

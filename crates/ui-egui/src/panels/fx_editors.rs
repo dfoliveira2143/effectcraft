@@ -39,6 +39,7 @@ pub const COLORAMA: &str = "ec.color.colorama";
 pub const GLOW: &str = "ec.stylize.glow";
 pub const RESHAPE: &str = "ec.distort.reshape";
 pub const EXTRACTOR: &str = "ec.3d.extractor";
+pub const CRYPTOMATTE: &str = "ec.3d.cryptomatte";
 pub const MESH_WARP: &str = "ec.distort.meshwarp";
 
 fn str_value(layer: &Layer, ectx: &EvalCtx, g: &PropGroup, id: &str) -> String {
@@ -66,19 +67,9 @@ fn register_points(app: &mut EffectcraftApp, prefix: &str, gr: Rect, pts: &[[f32
 }
 
 /// Small coloured tabs (`names[i]`, swatch `cols[i]`); returns the clicked one.
-fn tabs(
-    app: &mut EffectcraftApp,
-    ui: &mut egui::Ui,
-    p: &egui::Painter,
-    x0: f32,
-    cy: f32,
-    cur: usize,
-    names: &[&str],
-    cols: &[Color32],
-    id: &str,
-) -> Option<usize> {
+fn tabs(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, at: Pos2, cur: usize, (names, cols): (&[&str], &[Color32]), id: &str) -> Option<usize> {
     let t = app.tokens;
-    let mut x = x0;
+    let (mut x, cy) = (at.x, at.y);
     let mut out = None;
     for (i, name) in names.iter().enumerate() {
         let w = if cols.is_empty() { 16.0 + name.chars().count() as f32 * 6.2 } else { 20.0 };
@@ -188,7 +179,7 @@ fn rgb_curves(
     let cy = r.min.y + 15.0;
     let cols = [Color32::from_gray(0xe8), Color32::from_rgb(0xf0, 0x50, 0x50), Color32::from_rgb(0x50, 0xd0, 0x60), Color32::from_rgb(0x50, 0x80, 0xff)];
     let names: Vec<&str> = RGB_CURVES.iter().map(|c| c.1).collect();
-    if let Some(n) = tabs(app, ui, p, x0, cy, ch, &names, &cols, &format!("{prefix}.channel")) {
+    if let Some(n) = tabs(app, ui, p, pos2(x0, cy), ch, (&names, &cols), &format!("{prefix}.channel")) {
         app.ui.fx_curve_channel.insert(g.uid, n);
     }
     let id = RGB_CURVES[ch].0;
@@ -299,7 +290,7 @@ fn huesat_curves(
     let x0 = r.min.x + 38.0;
     let cy = r.min.y + 15.0;
     let names: Vec<&str> = HUESAT.iter().map(|c| c.1).collect();
-    if let Some(n) = tabs(app, ui, p, x0, cy, k, &names, &[], &format!("{prefix}.curve")) {
+    if let Some(n) = tabs(app, ui, p, pos2(x0, cy), k, (&names, &[]), &format!("{prefix}.curve")) {
         app.ui.fx_curve_channel.insert(g.uid, n);
     }
     let (id, name, axis, periodic) = HUESAT[k];
@@ -610,7 +601,7 @@ fn colorama_wheel(
     p.text(
         pos2(sr.min.x, sr.max.y + 9.0),
         Align2::LEFT_CENTER,
-        "Click the ring to add a colour; Alt-click a stop (or drag it off) to remove it",
+        crate::i18n::tr("Click the ring to add a colour; Alt-click a stop (or drag it off) to remove it"),
         Tokens::ui(10.5),
         t.text_faint,
     );
@@ -724,7 +715,7 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
     }
     let ch = app.ui.fx_curve_channel.get(&euid).copied().unwrap_or(0).min(2);
     let cols = [Color32::from_rgb(0xf0, 0x50, 0x50), Color32::from_rgb(0x50, 0xd0, 0x60), Color32::from_rgb(0x50, 0x80, 0xff)];
-    if let Some(n) = tabs(app, ui, p, x0, r.min.y + 15.0, ch, &["Red", "Green", "Blue"], &cols, &format!("{prefix}.channel")) {
+    if let Some(n) = tabs(app, ui, p, pos2(x0, r.min.y + 15.0), ch, (&["Red", "Green", "Blue"], &cols), &format!("{prefix}.channel")) {
         app.ui.fx_curve_channel.insert(euid, n);
     }
     if reset_link(app, ui, p, Rect::from_min_size(pos2(x0 + size - 44.0, r.min.y + 6.0), vec2(44.0, 18.0)), &format!("{prefix}.reset")) {
@@ -811,19 +802,19 @@ fn reshape_buttons(
     let b1 = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 4.0), vec2(84.0, 22.0));
     let b2 = Rect::from_min_size(pos2(b1.max.x + 8.0, b1.min.y), vec2(96.0, 22.0));
     let b3 = Rect::from_min_size(pos2(b2.max.x + 8.0, b1.min.y), vec2(56.0, 22.0));
-    if widgets::text_button(ui, b1, "Add Point", false, &t, egui::Id::unique(("reshape-add", euid))).clicked() {
+    if widgets::text_button(ui, b1, crate::i18n::tr("Add Point"), false, &t, egui::Id::unique(("reshape-add", euid))).clicked() {
         let mut v = pairs.clone();
         v.push(add_pair(&pairs));
         set_str(actions, layer, g, "correspondencePoints", format_pairs(&v), None);
     }
     app.auto.add(&format!("effectControls.effect.{euid}.reshape.add"), b1, "Add Point");
-    if widgets::text_button(ui, b2, "Remove Point", false, &t, egui::Id::unique(("reshape-remove", euid))).clicked() && !pairs.is_empty() {
+    if widgets::text_button(ui, b2, crate::i18n::tr("Remove Point"), false, &t, egui::Id::unique(("reshape-remove", euid))).clicked() && !pairs.is_empty() {
         let mut v = pairs.clone();
         v.pop();
         set_str(actions, layer, g, "correspondencePoints", format_pairs(&v), None);
     }
     app.auto.add(&format!("effectControls.effect.{euid}.reshape.remove"), b2, "Remove Point");
-    if widgets::text_button(ui, b3, "Clear", false, &t, egui::Id::unique(("reshape-clear", euid))).clicked() && !pairs.is_empty() {
+    if widgets::text_button(ui, b3, crate::i18n::tr("Clear"), false, &t, egui::Id::unique(("reshape-clear", euid))).clicked() && !pairs.is_empty() {
         set_str(actions, layer, g, "correspondencePoints", String::new(), None);
     }
     app.auto.add(&format!("effectControls.effect.{euid}.reshape.clear"), b3, "Clear");
@@ -846,6 +837,17 @@ const NO_CHANNEL: &str = "(none)";
 /// Whether `prop` (in group `g`) is one of EXtractoR's channel parameters.
 pub fn is_extractor_channel(g: &PropGroup, prop: &effectcraft_engine::project::Property) -> bool {
     matches!(&g.kind, GroupKind::Effect { effect } if effect == EXTRACTOR) && EXTRACTOR_CHANNELS.contains(&prop.match_id.as_str())
+}
+
+/// Whether `prop` (in group `g`) is the Cryptomatte effect's Layer.
+pub fn is_crypto_layer(g: &PropGroup, prop: &effectcraft_engine::project::Property) -> bool {
+    matches!(&g.kind, GroupKind::Effect { effect } if effect == CRYPTOMATTE) && prop.match_id == "layer"
+}
+
+/// Whether `prop` is the Layer of a Cryptomatte effect on `layer` (the timeline finds it without
+/// its group).
+pub fn is_crypto_layer_of(layer: &Layer, prop: &effectcraft_engine::project::Property) -> bool {
+    layer.effects().is_some_and(|fx| fx.groups().any(|g| g.match_id == CRYPTOMATTE && g.get("layer").is_some_and(|q| q.uid == prop.uid)))
 }
 
 /// The OpenEXR layer EXtractoR's red, green and blue come from (`""`: the unnamed layer), or

@@ -2,7 +2,7 @@ use super::foam::{FOAM_TEXTURES, foam};
 use super::pixels::{ball_action, pixel_polly, scatterize};
 use super::shatter::{CD_PROPS, CD_SOURCES, SHATTER_PATTERNS, SHATTER_TEXTURE_MODES, card_dance, shatter};
 use super::surfaces::{caustics, wave_world};
-use super::*;
+use super::{EffectSpec, ParamUi, Value, col, num, p, pct, popup, pt, slider, spec};
 
 // ------------------------------------------------------------------ specs
 
@@ -79,7 +79,7 @@ pub fn specs() -> Vec<EffectSpec> {
     vec![
         spec(
             "ec.sim.ccballaction",
-            "CC Ball Action",
+            "Ball Grid",
             vec![
                 p("scatter", "Scatter", num(0.0), slider(0.0, 2000.0, 0.0, 300.0, 1)),
                 p("rotationAxis", "Rotation Axis", Value::Enum(0), popup(&["X Axis", "Y Axis", "Z Axis", "XY Axis", "XZ Axis", "YZ Axis", "XYZ Axis"])),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<EffectSpec> {
         ),
         spec(
             "ec.sim.ccpixelpolly",
-            "CC Pixel Polly",
+            "Pixel Shatter",
             vec![
                 p("force", "Force", num(100.0), slider(-1000.0, 1000.0, -300.0, 300.0, 1)),
                 p("gravity", "Gravity", num(1.0), slider(-20.0, 20.0, -5.0, 5.0, 2)),
@@ -111,7 +111,7 @@ pub fn specs() -> Vec<EffectSpec> {
         ),
         spec(
             "ec.sim.ccscatterize",
-            "CC Scatterize",
+            "Pixel Scatter",
             vec![
                 p("scatter", "Scatter", num(0.0), slider(0.0, 1000.0, 0.0, 200.0, 1)),
                 p("rightTwist", "Right Twist", num(0.0), ParamUi::Angle),

@@ -321,6 +321,58 @@ fn content_aware_fill_removes_an_object() {
     assert!(s2.execute("contentFill.generate", json!({"wait": true, "outputDir": tmp("caf2").to_string_lossy()})).is_err());
 }
 
+/// A scratch folder that cannot be created surfaces as an error, not a cancelled fill or a
+/// black frame (#2570 review).
+#[test]
+fn content_aware_fill_reports_a_spill_failure() {
+    let (mut s, _, _, _) = setup(48, 32, 0.2, |f| {
+        let mut img = Image::new(48, 32);
+        for y in 0..32 {
+            for x in 0..48 {
+                img.set(x, y, bg(x as f32 + f as f32, y as f32));
+            }
+        }
+        img
+    });
+    s.execute("layer.addMask", json!({"rect": [20.0, 10.0, 8.0, 8.0], "mode": "subtract"})).unwrap();
+    let dir = tmp("cafspill");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("not-a-folder");
+    std::fs::write(&file, b"x").unwrap();
+    // The fill wants to create its spill here; the parent is a file.
+    let out = file.join("fills");
+    let e = s.execute("contentFill.generate", json!({"method": "object", "outputDir": out.to_string_lossy(), "wait": true})).unwrap_err();
+    // The OS wording differs ("Not a directory" on Unix, "Cannot create a file when that file
+    // already exists" on Windows), so look for the fill's own marker.
+    let msg = e.to_string();
+    assert!(msg.contains("spill: cannot make the scratch file"), "not a spill error: {msg}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A fill plan that comes back without files or frames (a job worker that wrote none) is an
+/// error, not a crash on the first file (#2570 review).
+#[test]
+fn content_aware_fill_without_files_is_an_error() {
+    let (mut s, cid, lid, _) = setup(48, 32, 0.2, |_| Image::filled(48, 32, [0.5, 0.5, 0.5, 1.0]));
+    let plan = crate::commands::content_fill::FillPlan {
+        comp: cid,
+        layer: lid,
+        name: "Clip".into(),
+        width: 48,
+        height: 32,
+        times: vec![Tick::ZERO],
+        method: "object".into(),
+        lighting: 0.0,
+        expand: 0,
+        reference: None,
+        dir: "Clip_Fill_1".into(),
+    };
+    assert!(crate::commands::content_fill::apply_plan(&mut s, &plan, vec![]).is_err());
+    let empty = crate::commands::content_fill::FillPlan { times: vec![], ..plan };
+    assert!(crate::commands::content_fill::apply_plan(&mut s, &empty, vec!["Clip_Fill_1/fill_00000.png".into()]).is_err());
+    assert_eq!(s.project.comp(cid).unwrap().layers.len(), 1, "no fill layer was added");
+}
+
 #[test]
 fn content_aware_fill_runs_in_the_background() {
     let (mut s, _, _, _) = setup(48, 32, 0.2, |f| {
@@ -671,4 +723,48 @@ fn footage_that_cannot_be_decoded_reports_why() {
     assert!(sum["items"].as_array().unwrap().iter().filter(|i| i["id"] != json!(item.0)).all(|i| i.get("problem").is_none()), "only footage reports one");
     s.execute("footage.open", json!({"item": item.0})).unwrap();
     assert_eq!(s.execute("footage.info", json!({})).unwrap()["problem"], it["problem"]);
+}
+
+/// A proxy in use that can't be decoded leaves its item without a picture although the item's
+/// own file is fine: `project.summary` and `footage.info` give the proxy's reason, said to be the
+/// proxy's, for footage and compositions alike, and nothing once Use Proxy is off.
+#[test]
+fn a_proxy_in_use_that_cannot_be_decoded_reports_why() {
+    struct BrokenProxies;
+    impl FootageSource for BrokenProxies {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn problem(&self, f: &Footage) -> Option<String> {
+            f.path.ends_with(".avi").then(|| format!("{} isn't supported by the built-in decoder", f.codec))
+        }
+    }
+    let mut s = Session { footage: Arc::new(BrokenProxies), ..Default::default() };
+    let comp = s.execute("comp.new", json!({"name": "C", "width": 64, "height": 36, "duration": 2})).unwrap()["comp"].as_u64().unwrap();
+    let still = Footage { kind: FootageKind::Still, path: "a.png".into(), width: 64, height: 36, has_video: true, ..Default::default() };
+    let item = std::sync::Arc::make_mut(&mut s.project).add_item("Plate", Default::default(), None, ItemKind::Footage(still));
+    let proxy = Footage {
+        kind: FootageKind::Video,
+        path: "plate.avi".into(),
+        codec: "MPEG-4 Part 2".into(),
+        width: 32,
+        height: 18,
+        has_video: true,
+        ..Default::default()
+    };
+    let want = json!("Proxy: MPEG-4 Part 2 isn't supported by the built-in decoder");
+    let problem = |s: &mut Session, id: u64| {
+        let sum = s.execute("project.summary", json!({})).unwrap();
+        sum["items"].as_array().unwrap().iter().find(|i| i["id"] == json!(id)).unwrap().get("problem").cloned()
+    };
+    for id in [item.0, comp] {
+        let p = std::sync::Arc::make_mut(&mut s.project);
+        p.items.get_mut(&ItemId(id)).unwrap().proxy = Some(Box::new(effectcraft_project::Proxy { footage: proxy.clone(), enabled: true }));
+        assert_eq!(problem(&mut s, id), Some(want.clone()), "item {id}");
+        std::sync::Arc::make_mut(&mut s.project).items.get_mut(&ItemId(id)).unwrap().proxy.as_mut().unwrap().enabled = false;
+        assert_eq!(problem(&mut s, id), None, "item {id}: its own file shows, and is fine");
+    }
+    std::sync::Arc::make_mut(&mut s.project).items.get_mut(&item).unwrap().proxy.as_mut().unwrap().enabled = true;
+    s.execute("footage.open", json!({"item": item.0})).unwrap();
+    assert_eq!(s.execute("footage.info", json!({})).unwrap()["problem"], want);
 }

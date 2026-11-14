@@ -10,11 +10,17 @@ use effectcraft_project::{GroupKind, Layer, LayerId, LayerSource, Node, Project,
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
+use super::effect::{effect_time_error, retime_effect};
+use super::text_anim::{per_char_on, set_animator_3d};
 use super::{CommandSpec, bad, frontend, has_comp, has_keys, has_layers, layer_mut, layers_p, match_path_of, resolve_effect_path, selected_leaf_props, str_p};
 use crate::{EngineError, KeyRef, Result, Session, cmd};
 
 /// Preset file format version tag (`*.ecpreset`, JSON).
 pub const PRESET_TAG: &str = "effectcraftAnimationPreset";
+/// The preset format version that `anim.savePreset` writes.
+pub const PRESET_VERSION: u64 = 3;
+/// The first preset version that stores effect keys relative to the earliest key (#1971).
+const RELATIVE_EFFECT_KEYS: u64 = 2;
 
 fn has_selected_props(s: &Session) -> std::result::Result<(), String> {
     has_comp(s)?;
@@ -45,14 +51,48 @@ fn selected_effects(s: &Session) -> Vec<(LayerId, PropGroup)> {
         .collect()
 }
 
+/// The text animators that hold a selected property, each once, in stack order. An animator is
+/// saved whole: its Properties say what changes and its Selectors where, so neither works alone.
+fn selected_animators(s: &Session) -> Vec<PropGroup> {
+    let Some(c) = s.active_comp() else { return vec![] };
+    let leaves = selected_leaf_props(s);
+    let mut layers: Vec<LayerId> = vec![];
+    for (lid, _) in &leaves {
+        if !layers.contains(lid) {
+            layers.push(*lid);
+        }
+    }
+    let mut out = vec![];
+    for lid in layers {
+        let Some(list) = c.layer(lid).and_then(|l| l.props.group("text/animators")) else { continue };
+        out.extend(list.groups().filter(|g| leaves.iter().any(|(l, u)| *l == lid && g.find(*u).is_some())).cloned());
+    }
+    out
+}
+
+/// The earliest key anywhere in `groups`, nested controls included.
+fn earliest_key<'a>(groups: impl IntoIterator<Item = &'a PropGroup>) -> Option<Tick> {
+    let mut first: Option<Tick> = None;
+    for g in groups {
+        g.walk("", &mut |_, pr| {
+            if let Some(t) = pr.keys.iter().map(|k| k.time).min() {
+                first = Some(first.map_or(t, |f| f.min(t)));
+            }
+        });
+    }
+    first
+}
+
 // ---------------------------------------------------------------- presets
 
 fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("anim.savePreset", "missing `path`"))?.to_string();
+    s.refuse_export(&path)?;
     let comp = s.active_comp().ok_or(EngineError::NoComp)?;
     let t = s.time();
-    let effects: Vec<(LayerId, PropGroup)> = selected_effects(s);
+    let mut effects: Vec<(LayerId, PropGroup)> = selected_effects(s);
     let effect_uids: Vec<Uid> = effects.iter().map(|(_, g)| g.uid).collect();
+    let mut animators = selected_animators(s);
     let mut props = vec![];
     for (lid, uid) in selected_leaf_props(s) {
         let Some(l) = comp.layer(lid) else { continue };
@@ -60,14 +100,26 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
         if l.effects().is_some_and(|fx| fx.groups().any(|g| effect_uids.contains(&g.uid) && g.find(uid).is_some())) {
             continue;
         }
+        // So do properties inside a saved text animator.
+        if animators.iter().any(|g| g.find(uid).is_some()) {
+            continue;
+        }
         let (Some(pr), Some(mp)) = (l.props.find(uid), match_path_of(&l.props, uid)) else { continue };
         props.push((l.layer_time(t), mp, pr.clone()));
     }
-    if props.is_empty() && effects.is_empty() {
+    if props.is_empty() && effects.is_empty() && animators.is_empty() {
         return Err(bad("anim.savePreset", "select properties or effects to save"));
     }
     // Key times are stored relative to the earliest key so the preset applies at the CTI.
-    let first = props.iter().flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time)).min().unwrap_or(Tick::ZERO);
+    let first = props
+        .iter()
+        .flat_map(|(_, _, pr)| pr.keys.iter().map(|k| k.time))
+        .chain(earliest_key(effects.iter().map(|(_, g)| g).chain(&animators)))
+        .min()
+        .unwrap_or(Tick::ZERO);
+    for g in effects.iter_mut().map(|(_, g)| g).chain(&mut animators) {
+        retime_effect(g, 1.0, "anim.savePreset", |t| Ok(Tick(t.0.checked_sub(first.0).ok_or_else(|| effect_time_error("anim.savePreset"))?)))?;
+    }
     let props_json: Vec<Value> = props
         .iter()
         .map(|(_, mp, pr)| {
@@ -82,10 +134,41 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name")
         .map(str::to_string)
         .unwrap_or_else(|| std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-    let doc = json!({PRESET_TAG: 1, "name": name, "properties": props_json, "effects": fx_json});
+    let doc = json!({PRESET_TAG: PRESET_VERSION, "name": name, "properties": props_json, "effects": fx_json, "textAnimators": animators});
     let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
-    s.services.write_file(&path, text.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
-    Ok(json!({"path": path, "properties": props.len(), "effects": effects.len()}))
+    s.write_output(&path, text.as_bytes())?;
+    Ok(json!({"path": path, "properties": props.len(), "effects": effects.len(), "textAnimators": animators.len()}))
+}
+
+/// Rewrite an effect property path in a preset (`effects/<effect id>[#n]/<param>`) to the current
+/// parameter id when it names a parameter that the effect has since renamed or moved into a
+/// twirl-down group. Any other path comes back unchanged.
+fn upgrade_effect_path(path: &str) -> String {
+    let Some((seg, tail)) = path.strip_prefix("effects/").and_then(|r| r.split_once('/')) else { return path.to_string() };
+    let effect = match seg.rsplit_once('#') {
+        Some((m, n)) if !m.is_empty() && n.parse::<usize>().is_ok() => m,
+        _ => seg,
+    };
+    match effectcraft_effects::find(effect).and_then(|spec| effectcraft_effects::migrate::current_param_id(spec, tail)) {
+        Some(id) if id != tail => format!("effects/{seg}/{id}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The saved animators of a preset. A file that names one wrongly is refused, not partly applied.
+fn preset_animators(doc: &Value) -> Result<Vec<PropGroup>> {
+    let bad_file = |why: String| bad("anim.applyPreset", format!("bad text animator in the preset: {why}"));
+    match doc.get("textAnimators") {
+        None => Ok(vec![]),
+        Some(Value::Array(list)) => list
+            .iter()
+            .map(|v| {
+                let g: PropGroup = serde_json::from_value(v.clone()).map_err(|e| bad_file(e.to_string()))?;
+                if g.match_id == "animator" { Ok(g) } else { Err(bad_file(format!("`{}` is not an animator", g.match_id))) }
+            })
+            .collect(),
+        Some(_) => Err(bad_file("`textAnimators` is not a list".into())),
+    }
 }
 
 fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
@@ -100,24 +183,27 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
     if doc.get(PRESET_TAG).is_none() {
         return Err(bad("anim.applyPreset", "not an EffectCraft animation preset"));
     }
+    let animators = preset_animators(&doc)?;
     let (cid, ids) = layers_p(s, p)?;
     if ids.is_empty() {
         return Err(bad("anim.applyPreset", "select a layer"));
     }
-    // Animation ▸ Recent Animation Presets.
-    if let Some(path) = str_p(p, "path") {
-        s.prefs.push_recent_preset(path);
-        s.save_prefs();
-        s.prefs_revision += 1;
-    }
-    let effects: Vec<PropGroup> =
+    let mut effects: Vec<PropGroup> =
         doc["effects"].as_array().map(|a| a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()).unwrap_or_default();
+    // Older presets stored effect keys at the source layer's times.
+    if doc[PRESET_TAG].as_u64().unwrap_or(1) < RELATIVE_EFFECT_KEYS
+        && let Some(first) = earliest_key(&effects)
+    {
+        for g in &mut effects {
+            retime_effect(g, 1.0, "anim.applyPreset", |t| Ok(Tick(t.0.checked_sub(first.0).ok_or_else(|| effect_time_error("anim.applyPreset"))?)))?;
+        }
+    }
     let props: Vec<(String, Property)> = doc["properties"]
         .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(|v| {
-                    let path = v["path"].as_str()?.to_string();
+                    let path = upgrade_effect_path(v["path"].as_str()?);
                     let value: KV = serde_json::from_value(v["value"].clone()).ok()?;
                     let keys: Vec<Keyframe> = serde_json::from_value(v["keys"].clone()).unwrap_or_default();
                     let expr = serde_json::from_value(v["expression"].clone()).ok().flatten();
@@ -129,17 +215,33 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
                 .collect()
         })
         .unwrap_or_default();
+    let saved_3d = props.iter().any(|(path, src)| path == "text/perChar3d" && src.value.as_bool());
     let t = s.time();
+    // Effect bounds per layer size the point defaults of parameters added since the preset was saved.
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let sizes: BTreeMap<LayerId, [f64; 2]> =
+        ids.iter().filter_map(|lid| comp.layer(*lid).map(|l| (*lid, effectcraft_render::effect_bounds(&s.project, comp, l).0))).collect();
     let mut applied = 0;
     let mut skipped = vec![];
     s.edit("Apply Animation Preset", None, |proj, _| {
         let mut next = proj.next_id;
         for lid in &ids {
+            let size = sizes.get(lid).copied().unwrap_or([100.0, 100.0]);
             let l = layer_mut(proj, cid, *lid)?;
             let lt = l.layer_time(t);
+            let was_three_d = per_char_on(l);
             if let Some(fx) = l.props.sub_mut("effects") {
                 for g in &effects {
                     let mut g = g.clone();
+                    // Effects saved by an earlier version get the upgrade a project gets on open.
+                    let spec = match &g.kind {
+                        GroupKind::Effect { effect } => effectcraft_effects::find(effect),
+                        _ => None,
+                    };
+                    if let Some(spec) = spec {
+                        effectcraft_effects::migrate::upgrade_instance(spec, &mut g, &mut Ids(&mut next), size);
+                    }
+                    retime_effect(&mut g, 1.0, "anim.applyPreset", |t| Ok(Tick(t.0.checked_add(lt.0).ok_or_else(|| effect_time_error("anim.applyPreset"))?)))?;
                     g.reassign_uids(&mut next);
                     next += 1;
                     fx.children.push(Node::Group(g));
@@ -168,10 +270,52 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
                     _ => skipped.push(path.clone()),
                 }
             }
+            // After the properties, so a saved Per-character 3D setting counts: it needs a 3D layer
+            // to draw, as `layer.enablePerChar3D` makes one. Without it the layer's setting stays.
+            // Existing animators follow changes to the saved Per-character 3D setting too.
+            let three_d = per_char_on(l);
+            l.switches.three_d |= three_d && saved_3d;
+            let Some(list) = l.props.group_mut("text/animators") else {
+                skipped.extend(animators.iter().map(|g| format!("text/animators/{}", g.name)));
+                continue;
+            };
+            if three_d != was_three_d {
+                for existing in &mut list.children {
+                    if let Node::Group(existing) = existing {
+                        set_animator_3d(&mut Ids(&mut next), existing, three_d);
+                    }
+                }
+            }
+            for g in &animators {
+                let mut g = g.clone();
+                // `reassign_uids` replaces every uid, the ones of properties added here included.
+                set_animator_3d(&mut Ids(&mut 0), &mut g, three_d);
+                retime_effect(&mut g, 1.0, "anim.applyPreset", |t| Ok(Tick(t.0.checked_add(lt.0).ok_or_else(|| effect_time_error("anim.applyPreset"))?)))?;
+                g.reassign_uids(&mut next);
+                next += 1;
+                list.children.push(Node::Group(g));
+                applied += 1;
+            }
+        }
+        // Without this, a preset that fits no layer does nothing and says nothing.
+        if applied == 0 && !skipped.is_empty() {
+            let legacy_text = doc[PRESET_TAG].as_u64().unwrap_or(1) < PRESET_VERSION && props.iter().any(|(path, _)| path.starts_with("text/animators/"));
+            let message = if legacy_text {
+                "nothing in this preset fits the layer. A text animation preset saved by an earlier version only updates animators a layer already has: save it again"
+            } else {
+                "nothing in this preset fits the selected layer(s)"
+            };
+            return Err(bad("anim.applyPreset", message));
         }
         proj.next_id = next;
         Ok(())
     })?;
+    // Animation ▸ Recent Animation Presets.
+    if let Some(path) = str_p(p, "path") {
+        s.prefs.push_recent_preset(path);
+        s.save_prefs();
+        s.prefs_revision += 1;
+    }
     Ok(json!({"applied": applied, "skipped": skipped}))
 }
 
@@ -184,7 +328,7 @@ fn add_keyframe(s: &mut Session, _: &Value) -> Result<Value> {
     }
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
     let t = s.time();
-    let n = s.edit("Add Keyframe", None, |proj, _| {
+    let n = s.edit("Add Keyframe", None, |proj, state| {
         let mut n = 0;
         for (lid, uid) in &targets {
             let l = layer_mut(proj, cid, *lid)?;
@@ -200,6 +344,9 @@ fn add_keyframe(s: &mut Session, _: &Value) -> Result<Value> {
                 pr.set_value_at(lt, v);
             }
             n += 1;
+            if pr.match_id == "type" {
+                super::prop::sync_polystar_property(proj, state, cid, *lid, *uid, t)?;
+            }
         }
         Ok(n)
     })?;
@@ -209,7 +356,8 @@ fn add_keyframe(s: &mut Session, _: &Value) -> Result<Value> {
 /// Selected keys grouped by (layer, property).
 fn keys_by_prop(s: &Session) -> BTreeMap<(LayerId, Uid), Vec<Tick>> {
     let mut m: BTreeMap<(LayerId, Uid), Vec<Tick>> = BTreeMap::new();
-    for k in &s.state.selected_keys {
+    let Some(comp) = s.active_comp() else { return m };
+    for k in super::prop::editable_keys(comp, &s.state.selected_keys) {
         m.entry((k.layer, k.prop)).or_default().push(k.time);
     }
     m
@@ -476,11 +624,19 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save Animation Preset...",
             ["Animation"],
             None,
-            "{path (.ecpreset), name?} — saves the selected properties/effects",
+            "{path (.ecpreset), name?} — saves the selected properties/effects; a text animator with a selected property is saved whole",
             has_selected_props,
             save_preset
         ),
-        cmd!("anim.applyPreset", "Apply Animation Preset...", ["Animation"], None, "{path | preset, layers?}", has_layers, apply_preset),
+        cmd!(
+            "anim.applyPreset",
+            "Apply Animation Preset...",
+            ["Animation"],
+            None,
+            "{path | preset, layers?} — saved effects and text animators are added to each layer, with their keys at the CTI",
+            has_layers,
+            apply_preset
+        ),
         cmd!("anim.addKeyframe", "Add Keyframe", ["Animation"], None, "{} — keys the selected properties at the CTI", has_selected_props, add_keyframe),
         cmd!(
             "keys.exponentialScale",
@@ -491,7 +647,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_keys,
             exponential_scale
         ),
-        cmd!("text.addSelector", "Add Text Selector", [], None, "{layer?, animator?: uid|index, kind: range|wiggly|expression}", has_text_layer, add_selector),
+        cmd!(
+            "text.addSelector",
+            "Add Text Selector",
+            [],
+            None,
+            "{layer?, animator?: uid|index (1-based; a uid match wins over an index), kind: range|wiggly|expression}",
+            has_text_layer,
+            add_selector
+        ),
         cmd!("text.removeAllAnimators", "Remove All Text Animators", ["Animation"], None, "{layers?}", has_text_layer, remove_all_animators),
         cmd!("anim.reveal", "Reveal Properties", [], None, "{kind: keyframes|animation|modified}", has_comp, reveal),
     ]

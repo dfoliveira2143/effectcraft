@@ -48,7 +48,6 @@ fn with_prop<T>(
     let t = s.time_of(cid);
     let linear = s.prefs.general.default_spatial_linear;
     s.edit(label, merge, |proj, state| {
-        let mut next = proj.next_id;
         let l = layer_mut(proj, cid, lid)?;
         let lt = l.layer_time(t);
         let pr = l.props.find_mut(uid).ok_or_else(|| bad("prop", "property vanished"))?;
@@ -64,15 +63,35 @@ fn with_prop<T>(
             }
         }
         if pr.match_id == "type" {
-            let removed = sync_polystar_type(l, uid, lt, &mut next)?;
-            if !removed.is_empty() {
-                state.selected_props.retain(|(layer, prop)| *layer != lid || !removed.contains(prop));
-                state.selected_keys.retain(|key| key.layer != lid || !removed.contains(&key.prop));
-            }
+            sync_polystar_property(proj, state, cid, lid, uid, t)?;
         }
-        proj.next_id = next;
         Ok(r)
     })
+}
+
+/// Keep Polystar controls and their selection references in the property's edit transaction.
+pub(super) fn sync_polystar_property(
+    proj: &mut effectcraft_project::Project,
+    state: &mut crate::EditorState,
+    cid: ItemId,
+    lid: LayerId,
+    uid: Uid,
+    time: Tick,
+) -> Result<()> {
+    let mut next = proj.next_id;
+    let layer = layer_mut(proj, cid, lid)?;
+    let removed = sync_polystar_type(layer, uid, layer.layer_time(time), &mut next)?;
+    if !removed.is_empty() {
+        if state.active_comp == Some(cid) {
+            state.selected_props.retain(|(layer, prop)| *layer != lid || !removed.contains(prop));
+            state.selected_keys.retain(|key| key.layer != lid || !removed.contains(&key.prop));
+        } else if let Some(selection) = state.comp_selections.get_mut(&cid) {
+            selection.props.retain(|(layer, prop)| *layer != lid || !removed.contains(prop));
+            selection.keys.retain(|key| key.layer != lid || !removed.contains(&key.prop));
+        }
+    }
+    proj.next_id = next;
+    Ok(())
 }
 
 /// A static Polygon has no inner controls; switching to Star creates them in schema order
@@ -228,7 +247,8 @@ fn property_reply(p: &Value, layer: &Layer, pr: &Property, time: Tick, value: Va
 /// property (by match path, `transform/position`, `effects/<effect>#n/<param>`) of every other
 /// selected, unlocked layer of the comp whose value is of the same kind, as (layer, uid). Empty
 /// when `selected` is not set or the edited layer isn't selected. After Effects applies a value
-/// edit, the stopwatch and the keyframe button to all selected layers (#355, #491).
+/// edit, the stopwatch and the keyframe button to all selected layers (#355, #491). A parameter
+/// of a selected Puppet pin also reaches the same parameter of the other selected pins (#1751).
 fn selected_twins(s: &Session, p: &Value, cmd: &str) -> Result<Vec<(LayerId, Uid)>> {
     if b_p(p, "selected") != Some(true) {
         return Ok(vec![]);
@@ -241,14 +261,31 @@ fn selected_twins(s: &Session, p: &Value, cmd: &str) -> Result<Vec<(LayerId, Uid
         return Ok(vec![]);
     }
     let kind = (pr.value.kind_name(), pr.value.components().len());
-    Ok(s.state
+    let same_kind = |q: &&Property| (q.value.kind_name(), q.value.components().len()) == kind;
+    let mut twins: Vec<(LayerId, Uid)> = s
+        .state
         .selected_layers
         .iter()
         .filter(|o| **o != lid)
         .filter_map(|o| comp.layer(*o))
         .filter(|l| !l.switches.locked)
-        .filter_map(|l| l.props.prop(&path).filter(|q| (q.value.kind_name(), q.value.components().len()) == kind).map(|q| (l.id, q.uid)))
-        .collect())
+        .filter_map(|l| l.props.prop(&path).filter(same_kind).map(|q| (l.id, q.uid)))
+        .collect();
+    // A parameter of a selected Puppet pin: the same parameter of every other selected pin, on
+    // this layer too, so several pins move or key together (#1751).
+    let pin = super::puppet::layer_pins(layer).find(|g| g.props().any(|q| q.uid == uid)).map(|g| g.uid);
+    if let Some(pin) = pin
+        && s.state.selected_props.contains(&(lid, pin))
+    {
+        for (ol, ou) in &s.state.selected_props {
+            let Some(other) = comp.layer(*ol).filter(|l| !l.switches.locked) else { continue };
+            let Some(q) = super::puppet::layer_pins(other).find(|g| g.uid == *ou).and_then(|g| g.get(&pr.match_id)).filter(same_kind) else { continue };
+            if (*ol, q.uid) != (lid, uid) && !twins.contains(&(*ol, q.uid)) {
+                twins.push((*ol, q.uid));
+            }
+        }
+    }
+    Ok(twins)
 }
 
 /// `p` aimed at property `uid` of layer `lid` instead.
@@ -267,8 +304,13 @@ fn twin_params(p: &Value, lid: LayerId, uid: Uid) -> Value {
 /// The value of property `uid` of `lid` at the CTI as numbers (Position with Separate
 /// Dimensions: its X / Y / Z Position).
 fn current_components(s: &Session, cid: ItemId, lid: LayerId, uid: Uid) -> Option<Vec<f64>> {
+    components_at(s, cid, lid, uid, None)
+}
+
+/// [`current_components`] at layer time `at` (the CTI when `None`).
+fn components_at(s: &Session, cid: ItemId, lid: LayerId, uid: Uid, at: Option<Tick>) -> Option<Vec<f64>> {
     let l = s.project.comp(cid)?.layer(lid)?;
-    let lt = l.layer_time(s.time_of(cid));
+    let lt = at.unwrap_or_else(|| l.layer_time(s.time_of(cid)));
     if let Some(tr) = l.transform()
         && tr.get("position").is_some_and(|q| q.uid == uid)
         && tr.get("positionX").is_some()
@@ -300,7 +342,9 @@ pub(crate) fn proportional_share(index: usize, count: usize) -> f64 {
 /// `prop.set`; with `selected`, also on the other selected layers: the same value, or with
 /// `offset` (a scrub) the same change from each layer's own value. A typed value with `dims`
 /// (the components edited, e.g. `[2]` for Z) sets only those components on the other layers,
-/// which keep the rest of their own value (#1434). With `offset` and
+/// which keep the rest of their own value (#1434); `follow` components move on each layer by the
+/// change its first typed component takes (linked Audio Levels keep each layer's balance, #2485).
+/// With `offset` and
 /// `proportional` (Proportional Scrubbing) each layer takes [`proportional_share`] of the change
 /// by its place in the selection order, the scrubbed layer too. One undo step (with `merge`,
 /// one that a continuing scrub keeps folding into).
@@ -325,13 +369,43 @@ fn set_selected(s: &mut Session, p: &Value) -> Result<Value> {
         (None, Some(a), Some(_)) if !scalar => Some(a.iter().filter_map(Value::as_u64).filter_map(|d| usize::try_from(d).ok()).collect()),
         _ => None,
     };
+    let follow: Vec<usize> =
+        p.get("follow").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_u64).filter_map(|d| usize::try_from(d).ok()).collect();
+    // A typed `*2`, `/2` (`factor`) or `+10` (`addend`) (#3195): each layer's own value times it
+    // or plus it, not the edited layer's result (which its range may have clamped).
+    let factor = p.get("factor").and_then(Value::as_f64).filter(|k| k.is_finite() && delta.is_none());
+    let addend = p.get("addend").and_then(Value::as_f64).filter(|n| n.is_finite() && delta.is_none());
+    let own_step = |v: f64| -> Option<f64> {
+        let r = match (factor, addend) {
+            (Some(k), _) => v * k,
+            (None, Some(n)) => v + n,
+            (None, None) => return None,
+        };
+        r.is_finite().then_some(r)
+    };
+    // Each layer's own value where `set` writes it (a `time` other than the CTI keys there).
     let typed = |s: &Session, q: &mut Value, olid: LayerId, ouid: Uid| {
+        let at = snapped_key_time(s, cid, olid, q, "prop.set").ok().flatten();
+        if scalar && let Some(v) = components_at(s, cid, olid, ouid, at).and_then(|c| c.first().copied()).and_then(own_step) {
+            q["value"] = json!(v);
+        }
         if let (Some(dims), Some(n)) = (&dims, &new)
-            && let Some(mut c) = current_components(s, cid, olid, ouid)
+            && let Some(mut c) = components_at(s, cid, olid, ouid, at)
         {
-            for &d in dims {
-                if let (Some(slot), Some(v)) = (c.get_mut(d), n.get(d)) {
-                    *slot = *v;
+            // The typed components' new values on this layer.
+            let typed_value = |c: &[f64], d: usize| {
+                if factor.is_some() || addend.is_some() { c.get(d).copied().and_then(own_step) } else { n.get(d).copied() }
+            };
+            let change = dims.first().and_then(|&d| Some(typed_value(&c, d)? - c.get(d)?)).unwrap_or(0.0);
+            let values: Vec<Option<f64>> = dims.iter().map(|&d| typed_value(&c, d)).collect();
+            for &d in &follow {
+                if let Some(slot) = c.get_mut(d) {
+                    *slot += change;
+                }
+            }
+            for (&d, v) in dims.iter().zip(values) {
+                if let (Some(slot), Some(v)) = (c.get_mut(d), v) {
+                    *slot = v;
                 }
             }
             q["value"] = json!(c);
@@ -368,12 +442,35 @@ fn set_selected(s: &mut Session, p: &Value) -> Result<Value> {
             let mut q = twin_params(p, olid, ouid);
             shifted(s, &mut q, olid, ouid, k);
             typed(s, &mut q, olid, ouid);
+            if is_mask_feather(s, cid, olid, ouid) {
+                non_negative(&mut q["value"]);
+            }
             // (a layer that can't take it, e.g. a clamped or static property, keeps its value)
             let _ = set(s, &q);
         }
         Ok(out)
     };
     if merge_p(p).is_some() { run(s) } else { super::app_more::grouped(s, "Change Property", run) }
+}
+
+/// Whether property `uid` of `lid` is a mask's Mask Feather, which is never negative (After
+/// Effects; the panels clamp a typed or scrubbed value at 0).
+fn is_mask_feather(s: &Session, cid: ItemId, lid: LayerId, uid: Uid) -> bool {
+    let Some(l) = s.project.comp(cid).and_then(|c| c.layer(lid)) else { return false };
+    l.props.find(uid).is_some_and(|q| q.match_id == "feather") && l.props.parent_of(uid).is_some_and(|g| matches!(g.kind, GroupKind::Mask { .. }))
+}
+
+/// A JSON number, or each number of an array, raised to at least 0.
+fn non_negative(v: &mut Value) {
+    match v {
+        Value::Number(n) => {
+            if let Some(x) = n.as_f64().filter(|x| *x < 0.0) {
+                *v = json!(x.max(0.0));
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(non_negative),
+        _ => {}
+    }
 }
 
 /// `prop.toggleAnimation`; with `selected`, the other selected layers' same property follows.
@@ -491,6 +588,9 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
         "time": t.seconds(), "value": raw.to_json(), "animated": !pr.keys.is_empty(),
         "keys": keys, "expression": pr.expr.as_ref().map(|e| e.text.clone()),
     });
+    if let Some(o) = l.popup_options(pr) {
+        out["options"] = super::popup_options(&o);
+    }
     // With an expression, `value` is the keyframed (pre-expression) value; also report what the
     // expression makes of it (what renders), or why it fails. A disabled one renders `value`; one
     // disabled by its syntax error (prop.setExpression) reports that error.
@@ -502,8 +602,9 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
     } else if pr.has_expression()
         && let (Some(h), Some(comp)) = (s.expr.as_deref(), s.project.comp(cid))
     {
-        let mut ctx = crate::render::EvalCtx::new(&s.project, cid, comp, t);
-        ctx.expr = Some(h);
+        // The render's context, footage source included, so `sampleImage()` evaluates here as it
+        // renders and as `expr.errors` reports it (#3231).
+        let ctx = super::expr_tools::eval_ctx(s, cid, comp, t);
         match h.eval(&ctx, l, pr, &raw) {
             Ok(v) => out["evaluated"] = v.to_json(),
             Err(e) => {
@@ -661,12 +762,21 @@ fn set_expr(s: &mut Session, p: &Value) -> Result<Value> {
             s.project.comp(*cid).and_then(|c| c.layer(*lid).and_then(|l| super::link::reference(c, l, l, *uid, true))).unwrap_or_else(|| "value".into())
         })
         .collect();
-    let results = s.edit("Expression", merge_p(p), |proj, _| {
+    let times: Vec<_> = targets.iter().map(|(cid, _, _)| s.time_of(*cid)).collect();
+    let results = s.edit("Expression", merge_p(p), |proj, state| {
         let mut out = vec![];
-        for ((cid, lid, uid), def) in targets.iter().zip(&defs) {
+        let mut changed_types = vec![];
+        for (((cid, lid, uid), def), time) in targets.iter().zip(&defs).zip(&times) {
             let pr = layer_mut(proj, *cid, *lid)?.props.find_mut(*uid).ok_or_else(|| bad(C, "property vanished"))?;
             apply_expr(pr, &text, enabled, def);
             out.push(json!(pr.expr.as_ref().map(|e| e.text.clone())));
+            if pr.match_id == "type" {
+                changed_types.push((*cid, *lid, *uid, *time));
+            }
+        }
+        // All selected targets must be edited before a Type change can remove inner controls.
+        for (cid, lid, uid, time) in changed_types {
+            sync_polystar_property(proj, state, cid, lid, uid, time)?;
         }
         Ok(out)
     })?;
@@ -729,6 +839,8 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
     if !add {
         s.state.selected_props.clear();
         s.state.selected_vertices.clear();
+        // Groups (masks, effects) have no keys of their own: don't leave the old selection's behind.
+        s.state.selected_keys.clear();
     }
     if !s.state.selected_layers.contains(&lid) {
         s.state.selected_layers = vec![lid];
@@ -746,9 +858,6 @@ fn select_prop(s: &mut Session, p: &Value) -> Result<Value> {
         && let Some(pr) = s.active_comp().and_then(|c| c.layer(lid)).and_then(|l| l.props.find(uid))
     {
         let keys: Vec<KeyRef> = pr.keys.iter().map(|k| KeyRef { layer: lid, prop: uid, time: k.time }).collect();
-        if !add {
-            s.state.selected_keys.clear();
-        }
         s.state.selected_keys.extend(keys);
     }
     Ok(Value::Null)
@@ -883,6 +992,15 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// References that can be edited, including explicit key lists supplied by commands.
+pub(crate) fn editable_keys(comp: &effectcraft_project::Comp, selected: &[KeyRef]) -> Vec<KeyRef> {
+    selected.iter().filter(|key| key_layer_editable(comp, key.layer)).copied().collect()
+}
+
+pub(crate) fn key_layer_editable(comp: &effectcraft_project::Comp, layer: LayerId) -> bool {
+    comp.layer(layer).is_some_and(|layer| !layer.switches.locked)
+}
+
 /// Apply `f` to every selected key; keeps the selection pointing at moved keys.
 pub(crate) fn edit_keys(s: &mut Session, label: &str, merge: Option<&str>, f: impl Fn(&mut Vec<Keyframe>, usize, &mut Tick) -> bool) -> Result<Value> {
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
@@ -895,7 +1013,16 @@ pub(crate) fn edit_keys(s: &mut Session, label: &str, merge: Option<&str>, f: im
             groups.entry((k.layer, k.prop)).or_default().push(k.time);
         }
         for ((lid, uid), times) in groups {
-            let Some(pr) = comp.layer_mut(lid).and_then(|l| l.props.find_mut(uid)) else { continue };
+            let Some(layer) = comp.layer_mut(lid) else { continue };
+            // A locked layer's keys stay as they are, and stay selected.
+            if layer.switches.locked {
+                for time in times {
+                    let r = KeyRef { layer: lid, prop: uid, time };
+                    remapped.insert(r, r);
+                }
+                continue;
+            }
+            let Some(pr) = layer.props.find_mut(uid) else { continue };
             // Process each stored key once, in an order that avoids collisions when moving.
             let mut idx: Vec<(usize, Tick)> = times.iter().filter_map(|t| key_at(&pr.keys, *t).map(|i| (i, *t))).collect();
             idx.sort_by_key(|x| x.0);
@@ -1042,10 +1169,16 @@ fn move_keys(s: &mut Session, p: &Value) -> Result<Value> {
 fn delete_keys(s: &mut Session, _: &Value) -> Result<Value> {
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
     let sel = s.state.selected_keys.clone();
+    let time = s.time();
     s.edit("Delete Keyframes", None, |proj, st| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut removed = 0usize;
+        let mut changed = std::collections::BTreeSet::new();
         for k in &sel {
+            // A layer locked after its keys were selected keeps them (the selection stays too).
+            if comp.layer(k.layer).is_some_and(|l| l.switches.locked) {
+                continue;
+            }
             if let Some(pr) = comp.layer_mut(k.layer).and_then(|l| l.props.find_mut(k.prop))
                 && let Some(i) = key_at(&pr.keys, k.time)
             {
@@ -1054,9 +1187,15 @@ fn delete_keys(s: &mut Session, _: &Value) -> Result<Value> {
                 }
                 pr.keys.remove(i);
                 removed += 1;
+                if pr.match_id == "type" {
+                    changed.insert((k.layer, k.prop));
+                }
             }
         }
-        st.selected_keys.clear();
+        st.selected_keys.retain(|k| comp.layer(k.layer).is_some_and(|l| l.switches.locked));
+        for (layer, prop) in changed {
+            sync_polystar_property(proj, st, cid, layer, prop, time)?;
+        }
         // The keys actually removed: a selected key that is gone (or listed twice) isn't counted,
         // so a caller can tell that a delete changed nothing.
         Ok(json!(removed))
@@ -1189,6 +1328,15 @@ fn toggle_hold(s: &mut Session, _: &Value) -> Result<Value> {
     })
 }
 
+fn set_muted(s: &mut Session, p: &Value) -> Result<Value> {
+    let muted = b_p(p, "muted").unwrap_or(true);
+    let label = if muted { "Mute Keyframes" } else { "Unmute Keyframes" };
+    edit_keys(s, label, None, move |keys, i, _| {
+        keys[i].muted = muted;
+        false
+    })
+}
+
 /// A number or a per-dimension array of numbers.
 fn nums_p(p: &Value, k: &str, scale: f64) -> Option<Vec<f64>> {
     match p.get(k)? {
@@ -1267,6 +1415,13 @@ fn convert_expr_to_keys(s: &mut Session, p: &Value) -> Result<Value> {
         if sel.is_empty() {
             return Err(bad(CMD, "no `path` given and no selected property has an expression"));
         }
+        // Every layer is checked before the first is converted: a refusal leaves them all as they were.
+        let step = comp.frame_duration().0;
+        for (lid, _) in &sel {
+            if let Some(l) = comp.layer(*lid) {
+                check_convertible(step, l)?;
+            }
+        }
         let mut n = 0;
         for (lid, uid) in sel {
             n += convert_one_expr(s, cid, lid, uid)?.as_u64().unwrap_or(0);
@@ -1277,16 +1432,49 @@ fn convert_expr_to_keys(s: &mut Session, p: &Value) -> Result<Value> {
     convert_one_expr(s, cid, lid, uid)
 }
 
+/// Most keyframes Convert Expression to Keyframes makes: 2^20, 4.8 hours at 60 fps (After Effects
+/// compositions run to 3 hours, 648,000 frames at 60 fps).
+const MAX_CONVERTED_KEYS: u64 = 1 << 20;
+const _: () = assert!(MAX_CONVERTED_KEYS >= 3 * 3600 * 60);
+
+/// One evaluation and one key per frame of the layer: its In and Out points and the composition's
+/// frame duration are saved data, so the step must advance and the count (a partial last frame
+/// rounded up, as the loop steps, in 128 bits) is checked before any key is made.
+fn check_convertible(step: i64, layer: &Layer) -> Result<()> {
+    const CMD: &str = "prop.convertExpressionToKeyframes";
+    if step <= 0 {
+        return Err(bad(CMD, "the composition's frame duration is not positive"));
+    }
+    let (step, span) = (i128::from(step), i128::from(layer.out_point.0) - i128::from(layer.in_point.0));
+    let frames = if span > 0 { (span + step - 1) / step } else { 0 };
+    if frames > i128::from(MAX_CONVERTED_KEYS) {
+        return Err(bad(CMD, format!("the layer spans {frames} frames; at most {MAX_CONVERTED_KEYS} are converted")));
+    }
+    Ok(())
+}
+
+/// Replaces the expression on one property with keyframes sampled from its evaluated values.
+/// Returns the number of properties converted.
 fn convert_one_expr(s: &mut Session, cid: ItemId, lid: LayerId, uid: Uid) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let layer = comp.layer(lid).ok_or(EngineError::NoComp)?.clone();
     let pr = layer.props.find(uid).ok_or_else(|| bad("prop.convertExpressionToKeyframes", "no property"))?.clone();
-    let mut keys = vec![];
     let fd = comp.frame_duration();
+    check_convertible(fd.0, &layer)?;
+    let mut keys = vec![];
     let mut t = layer.in_point;
     while t < layer.out_point {
-        let ctx =
-            effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp: &comp, time: t, expr: s.expr.as_deref(), footage: Some(s.footage.as_ref()) };
+        let ctx = effectcraft_render::EvalCtx {
+            project: &s.project,
+            comp_id: cid,
+            comp: &comp,
+            time: t,
+            expr: s.expr.as_deref(),
+            footage: Some(s.footage.as_ref()),
+            property_overrides: &[],
+            media_overrides: &[],
+            reads: None,
+        };
         keys.push(Keyframe::new(layer.layer_time(t), ctx.value(&layer, &pr)));
         t += fd;
     }
@@ -1302,6 +1490,7 @@ fn convert_one_expr(s: &mut Session, cid: ItemId, lid: LayerId, uid: Uid) -> Res
     })
 }
 
+/// Returns the command specs for the property commands (get, set, keyframes, expressions and the rest).
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         query!("prop.get", "Get Property", "{layer?, path|prop, time? (comp s)}", get),
@@ -1310,7 +1499,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Property Value",
             [],
             None,
-            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all), dims? (with selected, a typed value: the components edited, e.g. [2] for Z; the other layers keep the rest of their own value)}",
+            "{layer?, path|prop, value, time? (layer s by default), timeBase?: layer|comp, merge?, selected? (also the other selected layers), offset? (them by the same change), proportional? (with offset: Proportional Scrubbing, each layer by its share in selection order, the first none, the last all), dims? (with selected, a typed value: the components edited, e.g. [2] for Z; the other layers keep the rest of their own value), follow? (with dims: components that move on each other layer by the change its first typed component takes), factor? (with selected, a typed `*` or `/`: the other layers take their own value times it, in the dims components of a vector), addend? (the same for a typed `+`: their own value plus it)}",
             has_layers,
             set_selected
         ),
@@ -1373,6 +1562,7 @@ pub fn specs() -> Vec<CommandSpec> {
             &json!({"which": "out"})
         )),
         cmd!("keys.toggleHold", "Toggle Hold Keyframe", ["Animation"], Some("Cmd+Alt+H"), "{}", has_keys, toggle_hold),
+        cmd!("keys.setMuted", "Mute Keyframes", ["Animation"], None, "{muted?: bool (default true)}", has_keys, set_muted),
         cmd!(
             "keys.interpolation",
             "Keyframe Interpolation...",

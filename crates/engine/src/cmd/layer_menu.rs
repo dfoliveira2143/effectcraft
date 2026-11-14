@@ -61,7 +61,7 @@ fn quality(s: &mut Session, p: &Value) -> Result<Value> {
         q => return Err(bad("layer.quality", format!("quality must be best|draft|wireframe, not `{q}`"))),
     };
     s.edit("Layer Quality", None, |proj, _| {
-        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.switches.quality = q;
         }
         Ok(())
@@ -84,7 +84,7 @@ fn sampling(s: &mut Session, p: &Value) -> Result<Value> {
         q => q,
     };
     s.edit("Layer Sampling", None, |proj, _| {
-        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.switches.sampling = q;
         }
         Ok(())
@@ -101,7 +101,7 @@ fn frame_blending(s: &mut Session, p: &Value) -> Result<Value> {
         m => return Err(bad("layer.frameBlending", format!("mode must be off|frameMix|pixelMotion, not `{m}`"))),
     };
     s.edit("Frame Blending", None, |proj, _| {
-        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.switches.frame_blend = m;
         }
         Ok(())
@@ -116,7 +116,7 @@ fn hide_other_video(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Hide Other Video", None, |proj, _| {
         // Every layer has a Video switch (nulls, cameras and lights included, as the Timeline's
         // eye cell shows): the selection stays shown.
-        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut().filter(|l| !ids.contains(&l.id)) {
+        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut_where(|l| !ids.contains(&l.id)) {
             l.switches.video = false;
         }
         Ok(())
@@ -130,7 +130,7 @@ fn show_all_video(s: &mut Session, p: &Value) -> Result<Value> {
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         // Track mattes stay hidden (their video switch is off by design).
         let mattes: Vec<LayerId> = c.layers.iter().filter_map(|l| l.track_matte.map(|m| m.layer)).collect();
-        for l in c.layers.iter_mut().filter(|l| !mattes.contains(&l.id)) {
+        for l in c.layers.iter_mut_where(|l| !mattes.contains(&l.id)) {
             l.switches.video = true;
         }
         Ok(())
@@ -154,7 +154,7 @@ fn expressions(s: &mut Session, p: &Value) -> Result<Value> {
     let on = b_p(p, "enabled").unwrap_or(true);
     let n = s.edit(if on { "Enable Expressions" } else { "Disable Expressions" }, None, |proj, _| {
         let mut n = 0;
-        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.props.walk_mut(&mut |pr| {
                 if let Some(e) = &mut pr.expr {
                     e.enabled = on;
@@ -243,17 +243,80 @@ fn set_transform(s: &mut Session, p: &Value) -> Result<Value> {
 fn center_anchor(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, ids) = layers_p(s, p)?;
     let ids = super::unlocked(s, cid, ids, "layer.centerAnchor")?;
+    move_anchor(s, cid, &ids, "Center Anchor Point", false, |[x0, y0, x1, y1]| [(x0 + x1) / 2.0, (y0 + y1) / 2.0])
+}
+
+/// The nine points Quick Set Anchor offers, as `(name, column, row)`: column 0 is the left edge
+/// of the layer's content, 2 the right; row 0 the top, 2 the bottom.
+const ANCHOR_POINTS: [(&str, u8, u8); 9] = [
+    ("topLeft", 0, 0),
+    ("top", 1, 0),
+    ("topRight", 2, 0),
+    ("left", 0, 1),
+    ("center", 1, 1),
+    ("right", 2, 1),
+    ("bottomLeft", 0, 2),
+    ("bottom", 1, 2),
+    ("bottomRight", 2, 2),
+];
+
+/// `layer.quickSetAnchor {point, layers?}`: move the Anchor Point of the 2D layers to one of the
+/// nine points of their content (corners, edge midpoints, centre) and shift Position, and every
+/// Position key, so nothing moves on screen. 3D and locked layers, and layers with an animated
+/// (or expression-driven) Anchor Point, Scale or Rotation, an expression on Position, or Auto-Orient
+/// along the path, are skipped; an error when no layer is left or none has content bounds.
+fn quick_set_anchor(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "layer.quickSetAnchor";
+    let name = str_p(p, "point").ok_or_else(|| bad(c, "missing `point`"))?;
+    let (_, col, row) = ANCHOR_POINTS
+        .iter()
+        .copied()
+        .find(|(n, ..)| *n == name)
+        .ok_or_else(|| bad(c, format!("unknown point `{name}`; one of {}", ANCHOR_POINTS.map(|(n, ..)| n).join(", "))))?;
+    let (cid, ids) = layers_p(s, p)?;
+    let ids = super::unlocked(s, cid, ids, c)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    // The anchor is set at the current time and the Position shift is worked out from the current
+    // Anchor Point, Scale and Rotation, so a layer where any of them changes over time would move
+    // at other frames: it is skipped like a 3D one. So is a layer whose Position is expression-
+    // driven (the expression would override the shifted value and the layer would jump), and one
+    // that orients itself along its path (the renderer adds the path direction to Rotation).
+    let changes = |l: &effectcraft_project::Layer| {
+        let Some(tr) = l.transform() else { return false };
+        let moving = ["anchor", "scale", "rotation"].iter().any(|m| tr.get(m).is_some_and(|p| p.is_animated() || p.has_expression()));
+        let driven = ["position", "positionX", "positionY"].iter().any(|m| tr.get(m).is_some_and(|p| p.has_expression()));
+        moving || driven || l.auto_orient == effectcraft_project::AutoOrient::AlongPath
+    };
+    let flat: Vec<LayerId> = ids.into_iter().filter(|id| comp.layer(*id).is_some_and(|l| !l.is_3d() && !changes(l))).collect();
+    if flat.is_empty() {
+        return Err(bad(
+            c,
+            "Quick Set Anchor works on 2D layers whose Anchor Point, Scale and Rotation are not animated, whose Position has no expression and that do not auto-orient along a path",
+        ));
+    }
+    let at = |lo: f64, hi: f64, i: u8| lo + (hi - lo) * f64::from(i) / 2.0;
+    move_anchor(s, cid, &flat, "Quick Set Anchor", true, |[x0, y0, x1, y1]| [at(x0, x1, col), at(y0, y1, row)])
+}
+
+/// Move each layer's Anchor Point to `target(content bounds)` (layer space) and offset Position
+/// by the matching amount, so the layer stays put over its whole animation. Layers without content
+/// bounds (an empty text or shape layer) are left alone; with `strict` it is an error when none of
+/// the layers has any, so the command does not report success for a no-op.
+fn move_anchor(s: &mut Session, cid: ItemId, ids: &[LayerId], label: &str, strict: bool, target: impl Fn([f64; 4]) -> [f64; 2]) -> Result<Value> {
     let t = s.time();
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, comp, t);
     let mut centers = vec![];
-    for lid in &ids {
+    for lid in ids {
         let Some(l) = comp.layer(*lid) else { continue };
-        if let Some([x0, y0, x1, y1]) = effectcraft_render::content_bounds(&ctx, l) {
-            centers.push((*lid, [(x0 + x1) / 2.0, (y0 + y1) / 2.0]));
+        if let Some(b) = effectcraft_render::content_bounds(&ctx, l) {
+            centers.push((*lid, target(b)));
         }
     }
-    s.edit("Center Anchor Point", None, |proj, _| {
+    if strict && centers.is_empty() {
+        return Err(bad("layer.quickSetAnchor", "none of the layers has content to anchor to (empty text or shape layers have no bounds)"));
+    }
+    s.edit(label, None, |proj, _| {
         for (lid, c) in &centers {
             let l = layer_mut(proj, cid, *lid)?;
             let lt = l.layer_time(t);
@@ -586,7 +649,7 @@ fn markers_lock(s: &mut Session, p: &Value) -> Result<Value> {
     let r = s.edit("Lock Markers", None, |proj, _| {
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let target = v.unwrap_or_else(|| !c.layers.iter().find(|l| ids.contains(&l.id)).is_some_and(|l| l.markers_locked));
-        for l in c.layers.iter_mut().filter(|l| ids.contains(&l.id)) {
+        for l in c.layers.iter_mut_where(|l| ids.contains(&l.id)) {
             l.markers_locked = target;
         }
         Ok(target)
@@ -597,7 +660,7 @@ fn markers_lock(s: &mut Session, p: &Value) -> Result<Value> {
 fn delete_all_markers(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, ids) = layers_p(s, p)?;
     s.edit("Delete All Markers", None, |proj, _| {
-        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut().filter(|l| ids.contains(&l.id) && !l.markers_locked) {
+        for l in proj.comp_mut(cid).ok_or(EngineError::NoComp)?.layers.iter_mut_where(|l| ids.contains(&l.id) && !l.markers_locked) {
             l.markers.clear();
         }
         Ok(())
@@ -609,6 +672,7 @@ fn delete_all_markers(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn track_matte_op(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, ids) = layers_p(s, p)?;
+    let ids = super::unlocked(s, cid, ids, "layer.trackMatte")?;
     let op = str_p(p, "op").ok_or_else(|| bad("layer.trackMatte", "missing `op`"))?.to_string();
     let kind = match op.as_str() {
         "alpha" => Some(MatteKind::Alpha),
@@ -717,6 +781,9 @@ fn opens_as_bundle(dir: &std::path::Path) -> bool {
 /// plain folder after following links, is refused.
 pub(crate) fn reveal_url(s: &Session, stored: &str) -> std::result::Result<String, String> {
     let path = s.stored_path(stored).map_err(|why| crate::doc_path::refusal(stored, why))?;
+    if !s.services.exists(&path.to_string_lossy()) {
+        return Err(format!("Missing footage: {stored}. Use File ▸ Dependencies ▸ Relink Missing Footage or Replace Footage."));
+    }
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).ok_or_else(|| format!("{stored} is not in a folder"))?;
     let real = std::fs::canonicalize(dir).map_err(|e| format!("cannot show the folder of {stored}: {e}"))?;
     if !real.is_dir() || opens_as_bundle(dir) || opens_as_bundle(&real) {
@@ -800,8 +867,8 @@ impl Session {
             });
             for pr in has {
                 let text = pr.expr.as_ref().map(|e| e.text.clone()).unwrap_or_default();
-                let mut ctx = effectcraft_render::EvalCtx::new(&self.project, cid, comp, t);
-                ctx.expr = Some(host.as_ref());
+                // With the footage source, so `sampleImage()` doesn't fail here only (#3231).
+                let ctx = super::expr_tools::eval_ctx(self, cid, comp, t);
                 if let Err(e) = host.eval(&ctx, l, pr, &pr.value_at(l.layer_time(t))) {
                     errors.push(json!({"layer": l.id.0, "prop": pr.uid, "name": pr.name, "expression": text, "error": e}));
                 }
@@ -902,6 +969,15 @@ pub fn specs() -> Vec<CommandSpec> {
             center_anchor
         ),
         cmd!(
+            "layer.quickSetAnchor",
+            "Quick Set Anchor",
+            ["Layer", "Transform", "Quick Set Anchor"],
+            None,
+            "{point: topLeft|top|topRight|left|center|right|bottomLeft|bottom|bottomRight, layers?} → {layers}: moves the Anchor Point of 2D layers to that point of their content and compensates Position (and its keys); skips 3D and locked layers and those with an animated Anchor Point, Scale or Rotation",
+            has_layers,
+            quick_set_anchor
+        ),
+        cmd!(
             "layer.mask.shape",
             "Mask Shape...",
             ["Layer", "Mask"],
@@ -965,6 +1041,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         for f in ["Clips", "Tool.app", "Shell.{20D04FE0-3AEA-1069-A2D8-08002B30309D}"] {
             std::fs::create_dir_all(d.join(f)).unwrap();
+            std::fs::write(d.join(f).join("a.mov"), b"fixture").unwrap();
         }
         let s = crate::Session::default();
         let reveal = |folder: &str| super::reveal_url(&s, &d.join(folder).join("a.mov").to_string_lossy());

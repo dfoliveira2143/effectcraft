@@ -26,8 +26,11 @@ impl FileDialog {
     }
 }
 
-/// Called with the paths a [`FileDialog`] picked (empty: cancelled), from any thread.
-pub type DialogDone = Box<dyn FnOnce(Vec<String>) + Send>;
+/// Called with the paths a [`FileDialog`] picked (empty: cancelled), from any thread, or with
+/// why the dialog couldn't open: the status line shows that and the command doesn't run. On
+/// macOS AppKit can fail to make the panel at all (`+[NSOpenPanel openPanel]` returned nil,
+/// #3084); the host catches that and answers with the error instead of taking the app down.
+pub type DialogDone = Box<dyn FnOnce(Result<Vec<String>, String>) + Send>;
 
 /// Host hooks provided by the native app (file pickers etc.).
 #[derive(Default)]
@@ -62,6 +65,10 @@ pub struct Hooks {
     /// Tells the user the graphics device was lost and the window is closing, once. `saved` is
     /// the auto-save of unsaved changes (`None`: nothing was unsaved), its path or why it failed.
     pub device_lost: Option<Box<dyn Fn(Option<Result<String, String>>)>>,
+    /// Runs on the worker thread right before the GPU compositor is built (desktop). Tests hold
+    /// it to look at the interface while the compositor is still being prepared, or make it
+    /// panic to check that a failing build never reaches the UI thread.
+    pub before_gpu_build: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Hooks {

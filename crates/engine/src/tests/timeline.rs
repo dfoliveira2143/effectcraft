@@ -298,6 +298,25 @@ fn interpolation_dialog_temporal_spatial_and_roving() {
     assert_ne!(prop(&s, l, "transform/position").keys[0].out_interp, Interp::Hold);
 }
 
+/// Editing another key's value or time keeps the roving key at its share of the path (#1284: the
+/// roving key went back to where it was after edits to other keys).
+#[test]
+fn roving_key_follows_value_and_time_edits_to_other_keys() {
+    let (mut s, l) = setup();
+    animate(&mut s, l, "transform/position", &[(0.0, json!([0, 0])), (0.3, json!([300, 0])), (2.0, json!([400, 0]))]);
+    let uid = prop(&s, l, "transform/position").uid;
+    s.execute("keys.select", json!({"keys": [{"layer": l, "prop": uid, "time": 0.3}]})).unwrap();
+    s.execute("keys.interpolation", json!({"roving": true})).unwrap();
+    let roving_at = |s: &Session| prop(s, l, "transform/position").keys[1].time.seconds();
+    assert!((roving_at(&s) - 1.5).abs() < 0.01, "start: {}", roving_at(&s));
+    // The last key's value moves to 800 px: the path is 300 + 500 px, so the roving key is at 300 / 800.
+    s.execute("keys.set", json!({"layer": l, "path": "transform/position", "time": 2.0, "value": [800, 0]})).unwrap();
+    assert!((roving_at(&s) - 0.75).abs() < 0.02, "value edit: {}", roving_at(&s));
+    // The last key moves to 3 s: the same 300 / 800 share of 3 s.
+    s.execute("keys.set", json!({"layer": l, "path": "transform/position", "time": 2.0, "newTime": 3.0})).unwrap();
+    assert!((roving_at(&s) - 1.125).abs() < 0.02, "time edit: {}", roving_at(&s));
+}
+
 #[test]
 fn graph_editor_key_and_handle_edits() {
     let (mut s, l) = setup();
@@ -323,6 +342,34 @@ fn graph_editor_key_and_handle_edits() {
     assert!((k.out_ease[0].influence - 0.6).abs() < 1e-9);
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(prop(&s, l, "transform/opacity").keys[0].out_interp, Interp::Linear);
+}
+
+#[test]
+fn graph_editor_ease_edits_reject_a_locked_layer() {
+    let (mut s, l) = setup();
+    animate(&mut s, l, "transform/opacity", &[(0.0, json!(0)), (1.0, json!(100)), (2.0, json!(0))]);
+    select_prop_keys(&mut s, l, "transform/opacity");
+    s.execute("layer.setSwitch", json!({"layers": [l], "switch": "locked", "value": true})).unwrap();
+    let before = prop(&s, l, "transform/opacity");
+    let selected = s.state.selected_keys.clone();
+    let undo = s.history.undo.len();
+    for side in ["in", "out"] {
+        let error =
+            s.execute("keys.setEase", json!({"layer": l, "path": "transform/opacity", "time": 1.0, "side": side, "speed": 200, "influence": 60})).unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        assert_eq!(prop(&s, l, "transform/opacity").keys, before.keys);
+        assert_eq!(s.state.selected_keys, selected);
+        assert_eq!(s.history.undo.len(), undo);
+    }
+    s.execute("layer.setSwitch", json!({"layers": [l], "switch": "locked", "value": false})).unwrap();
+    s.execute("keys.setEase", json!({"layer": l, "path": "transform/opacity", "time": 1.0, "side": "out", "speed": 200, "influence": 60})).unwrap();
+    let after = prop(&s, l, "transform/opacity");
+    assert_eq!(after.keys[1].out_interp, Interp::Bezier);
+    assert_eq!(after.keys[1].out_ease[0].speed, 200.0);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "transform/opacity").keys, before.keys);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "transform/opacity").keys, after.keys);
 }
 
 #[test]
@@ -602,6 +649,31 @@ fn time_set_keeps_the_frame_shown_in_the_current_time_field() {
     assert_eq!(r["frame"], 13);
 }
 
+/// A comp that starts before 0 shows its first frames as negative timecode (`-0:00:00:12`).
+/// Typing back what the current-time display shows (Go to Time opens with it) stays on that frame;
+/// the leading `-` used to move back from the current frame instead. A bare `-n` still steps back,
+/// and in a comp that starts at 0 a `-` stays relative.
+#[test]
+fn time_set_round_trips_negative_displayed_timecode() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Pre-roll", "width": 64, "height": 64, "frameRate": 24, "duration": 4, "startTime": -1})).unwrap();
+    for frame in [0_i64, 1, 12, 23, 24, 25, 60] {
+        let r = s.execute("time.set", json!({"frame": frame})).unwrap();
+        let display = r["display"].as_str().unwrap().to_string();
+        let r = s.execute("time.set", json!({"timecode": display})).unwrap();
+        assert_eq!(r["frame"], frame, "displayed {display}");
+    }
+    s.execute("time.set", json!({"frame": 12})).unwrap();
+    assert_eq!(s.execute("time.set", json!({"timecode": "-0:00:00:12"})).unwrap()["display"], "-0:00:00:12");
+    assert_eq!(s.execute("time.set", json!({"timecode": "-5"})).unwrap()["frame"], 7, "a bare -n steps back");
+    assert_eq!(s.execute("time.set", json!({"timecode": "-0:00:00:20"})).unwrap()["frame"], 4);
+    assert!(s.execute("time.set", json!({"timecode": "- -1:00"})).is_err(), "a second sign is still an error");
+
+    s.execute("comp.settings", json!({"startTime": 0})).unwrap();
+    s.execute("time.set", json!({"frame": 12})).unwrap();
+    assert_eq!(s.execute("time.set", json!({"timecode": "-0:00:00:02"})).unwrap()["frame"], 10, "relative when the comp starts at 0");
+}
+
 /// Frames display style: typed digits are a frame count, so 00100 is frame 100, not 1 s (#530).
 #[test]
 fn time_set_reads_frames_style_digits_as_a_frame_count() {
@@ -763,6 +835,59 @@ fn pick_whip_generates_ae_reference_expressions() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_ne!(prop(&s, l, "transform/position").expr.map(|e| e.text), Some("thisComp.layer(\"Other\").transform.position".into()));
     assert!(s.execute("prop.pickWhip", json!({"layer": l, "path": "transform/opacity", "target": {"layer": l, "path": "transform/opacity"}})).is_err());
+}
+
+/// #1072: an Alt pick whip (`byIndex`) selects an effect's properties by their index,
+/// `effect("Color Control")(1)`, its place among its group's children (nested groups too). The
+/// effect keeps its name; other properties, dimensions, insertion into an expression and match
+/// names (Compact English off) work as before. (`effectcraft-host`'s `pick_whip` tests check the
+/// references read the right values.)
+#[test]
+fn pick_whip_by_index_selects_effect_properties_by_their_index() {
+    let (mut s, l) = setup();
+    let o = s.execute("layer.newSolid", json!({"name": "Other", "color": "#00ff00"})).unwrap()["layer"].as_u64().unwrap();
+    for fx in ["Color Control", "Fractal Noise", "Point Control"] {
+        s.execute("effect.apply", json!({"layer": o, "effect": fx})).unwrap();
+    }
+    // Fractal Noise ▸ Transform ▸ Scale, by its places in the property tree.
+    let fx = s.active_comp().unwrap().layer(effectcraft_project::LayerId(o)).unwrap().props.sub("effects").unwrap().groups().nth(1).unwrap().clone();
+    let group = fx.children.iter().position(|c| c.match_id() == "transform").unwrap() + 1;
+    let scale = fx.sub("transform").unwrap().children.iter().position(|c| c.match_id() == "scale").unwrap() + 1;
+    let whip = |s: &mut Session, path: &str, target: Value, extra: Value| {
+        let mut p = json!({"layer": l, "path": path, "target": target, "byIndex": true});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        s.execute("prop.pickWhip", p).unwrap()
+    };
+    let other = "thisComp.layer(\"Other\")";
+    let undo = s.history.undo.len();
+    assert_eq!(
+        whip(&mut s, "transform/rotation", json!({"layer": o, "path": "effects/#1/color"}), json!({})),
+        json!(format!("{other}.effect(\"Color Control\")(1)[0]")),
+        "a colour into one value: its first"
+    );
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    let nested = format!("{other}.effect(\"Fractal Noise\")({group})({scale})");
+    assert_eq!(whip(&mut s, "transform/rotation", json!({"layer": o, "path": "effects/#2/transform/scale"}), json!({})), json!(nested));
+    assert_eq!(
+        whip(&mut s, "transform/opacity", json!({"layer": o, "path": "effects/#3/point", "dimension": 1}), json!({})),
+        json!(format!("{other}.effect(\"Point Control\")(1)[1]"))
+    );
+    assert_eq!(
+        whip(&mut s, "transform/rotation", json!({"layer": o, "path": "effects/#2/transform/scale"}), json!({"expression": "1 + ", "range": [4, 4]})),
+        json!(format!("1 + {nested}")),
+        "inserted at the cursor"
+    );
+    assert_eq!(
+        whip(&mut s, "transform/opacity", json!({"layer": o, "path": "transform/opacity"}), json!({})),
+        json!(format!("{other}.transform.opacity")),
+        "only an effect's properties go by index"
+    );
+    // Match names (Compact English off): the effect by its match name, its properties by index.
+    s.execute("prefs.set", json!({"key": "general.expressionPickWhipCompact", "value": false})).unwrap();
+    let e = whip(&mut s, "transform/rotation", json!({"layer": o, "path": "effects/#2/transform/scale"}), json!({}));
+    assert!(e.as_str().unwrap().ends_with(&format!("({group})({scale})")), "{e}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(prop(&s, l, "transform/rotation").expr.unwrap().text, format!("1 + {nested}"), "one undo per pick");
 }
 
 /// #407: Reset without a value gives a property its own default (a Transform property's, an
@@ -1429,4 +1554,113 @@ fn a_typed_component_applies_only_that_component_to_the_selected_layers() {
     // Without `dims` (agents setting a whole value) every selected layer takes the value as is.
     s.execute("prop.set", json!({"layer": a, "prop": uid, "value": [1.0, 2.0, 3.0], "selected": true})).unwrap();
     assert_eq!(pos(&s, c), vec![1.0, 2.0, 3.0]);
+}
+
+/// #3195: a typed `*2` or `/2` with several layers selected scales each layer's own value (in
+/// the typed components of a vector), not the edited layer's result.
+#[test]
+fn a_typed_factor_scales_each_selected_layers_own_value() {
+    let (mut s, a) = setup();
+    let b = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 50, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 40.0})).unwrap();
+    s.execute("prop.set", json!({"layer": b, "path": "transform/opacity", "value": 30.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/position", "value": [10.0, 20.0]})).unwrap();
+    s.execute("prop.set", json!({"layer": b, "path": "transform/position", "value": [100.0, 50.0]})).unwrap();
+    s.execute("layer.select", json!({"layers": [a, b]})).unwrap();
+    let opacity = prop(&s, a, "transform/opacity").uid;
+    let undo = s.history.undo.len();
+    s.execute_checked("prop.set", json!({"layer": a, "prop": opacity, "value": 80.0, "selected": true, "factor": 2.0})).unwrap();
+    assert_eq!(prop(&s, a, "transform/opacity").value.as_f64(), 80.0);
+    assert_eq!(prop(&s, b, "transform/opacity").value.as_f64(), 60.0, "B doubles its own 30");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    let position = prop(&s, a, "transform/position").uid;
+    s.execute_checked("prop.set", json!({"layer": a, "prop": position, "value": [5.0, 20.0], "selected": true, "dims": [0], "factor": 0.5})).unwrap();
+    assert_eq!(prop(&s, a, "transform/position").value.components()[..2], [5.0, 20.0]);
+    assert_eq!(prop(&s, b, "transform/position").value.components()[..2], [50.0, 50.0], "B halves its own X, keeps its Y");
+    // A typed `+10` (`addend`): each layer's own value plus 10, within its own range, even where
+    // the edited layer's range cut its change short (95 + 10 stops at 100).
+    s.execute("prop.set", json!({"layer": a, "path": "transform/opacity", "value": 95.0})).unwrap();
+    s.execute("prop.set", json!({"layer": b, "path": "transform/opacity", "value": 30.0})).unwrap();
+    s.execute_checked("prop.set", json!({"layer": a, "prop": opacity, "value": 100.0, "selected": true, "addend": 10.0})).unwrap();
+    assert_eq!(prop(&s, b, "transform/opacity").value.as_f64(), 40.0, "B adds 10, not the 5 A moved");
+    s.execute("prop.set", json!({"layer": b, "path": "transform/opacity", "value": 95.0})).unwrap();
+    s.execute_checked("prop.set", json!({"layer": a, "prop": opacity, "value": 100.0, "selected": true, "addend": 10.0})).unwrap();
+    assert_eq!(prop(&s, b, "transform/opacity").value.as_f64(), 100.0, "B's own range still applies");
+    s.execute_checked("prop.set", json!({"layer": a, "prop": position, "value": [15.0, 20.0], "selected": true, "dims": [0], "addend": 10.0})).unwrap();
+    assert_eq!(prop(&s, b, "transform/position").value.components()[..2], [60.0, 50.0], "B adds 10 to its own X");
+}
+
+/// #3195: Mask Feather is never negative on the other selected layers either, when a typed `*-1`
+/// (the edited layer clamped at 0 by the panel) or a change by the same amount takes theirs
+/// below 0.
+#[test]
+fn a_selected_mask_feather_stays_non_negative() {
+    let (mut s, a) = setup();
+    let b = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 50, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    for (l, feather) in [(a, [10.0, 20.0]), (b, [4.0, 30.0])] {
+        s.execute("mask.new", json!({"layer": l, "vertices": [[0, 0], [20, 0], [20, 20]]})).unwrap();
+        s.execute("prop.set", json!({"layer": l, "path": "masks/#1/feather", "value": feather})).unwrap();
+    }
+    s.execute("layer.select", json!({"layers": [a, b]})).unwrap();
+    let feather = |s: &Session, l: u64| prop(s, l, "masks/#1/feather").value.components();
+    let uid = prop(&s, a, "masks/#1/feather").uid;
+    // `*-1` into the linked pair: the panel clamps the edited layer at [0, 0].
+    s.execute_checked("prop.set", json!({"layer": a, "prop": uid, "value": [0.0, 0.0], "selected": true, "dims": [0, 1], "factor": -1.0})).unwrap();
+    assert_eq!(feather(&s, a), [0.0, 0.0]);
+    assert_eq!(feather(&s, b), [0.0, 0.0], "B is clamped at 0, not [-4, -30]");
+    // A change by the same amount (a scrub, or a typed `+`): A by [-10, -15] from [10, 20].
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute_checked("prop.set", json!({"layer": a, "prop": uid, "value": [0.0, 5.0], "selected": true, "offset": true})).unwrap();
+    assert_eq!(feather(&s, b), [0.0, 15.0], "B's X is clamped at 0, its Y moves by -15");
+}
+
+/// #2485: linked Audio Levels typed with several layers selected: each takes the typed Left, and
+/// its Right moves by its own change, so every layer keeps its own stereo balance.
+#[test]
+fn a_typed_component_moves_its_follow_components_by_each_layers_own_change() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Sound", "width": 64, "height": 36, "duration": 4})).unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "duration": 4})).unwrap();
+    let a = s.execute("layer.addItem", json!({"item": "Sound"})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.addItem", json!({"item": "Sound"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "audio/levels", "value": [-6.0, -12.0]})).unwrap();
+    s.execute("prop.set", json!({"layer": b, "path": "audio/levels", "value": [-20.0, -30.0]})).unwrap();
+    s.execute("layer.select", json!({"layers": [a, b]})).unwrap();
+    let uid = prop(&s, a, "audio/levels").uid;
+    let undo = s.history.undo.len();
+    s.execute_checked("prop.set", json!({"layer": a, "prop": uid, "value": [-3.0, -9.0], "selected": true, "dims": [0], "follow": [1]})).unwrap();
+    assert_eq!(prop(&s, a, "audio/levels").value.components(), vec![-3.0, -9.0]);
+    assert_eq!(prop(&s, b, "audio/levels").value.components(), vec![-3.0, -13.0], "B rises 17 dB on both channels");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+
+    // Keyed at a time other than the CTI: B's change is measured on its key there.
+    animate(&mut s, b, "audio/levels", &[(0.0, json!([-20.0, -30.0])), (1.0, json!([-10.0, -40.0]))]);
+    s.execute("prop.set", json!({"layer": a, "prop": uid, "value": [-4.0, -10.0], "time": 1.0, "selected": true, "dims": [0], "follow": [1]})).unwrap();
+    let keys: Vec<Vec<f64>> = prop(&s, b, "audio/levels").keys.iter().map(|k| k.value.components()).collect();
+    assert_eq!(keys, vec![vec![-20.0, -30.0], vec![-4.0, -34.0]], "B's 1 s key rises 6 dB on both channels");
+}
+
+#[test]
+fn convert_expression_to_keyframes_refuses_a_layer_of_millions_of_frames() {
+    let (mut s, l) = setup();
+    s.execute("prop.setExpression", json!({"layer": l, "path": "transform/rotation", "expression": "value"})).unwrap();
+    // A saved Out point a million seconds after the In point.
+    let cid = s.active_comp_id().unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(effectcraft_project::LayerId(l)).unwrap().out_point =
+        effectcraft_time::Tick::from_seconds_f64(1e6);
+    let e = s.execute("prop.convertExpressionToKeyframes", json!({"layer": l, "path": "transform/rotation"})).unwrap_err().to_string();
+    assert!(e.contains("at most"), "{e}");
+    assert!(prop(&s, l, "transform/rotation").keys.is_empty());
+}
+
+#[test]
+fn convert_expression_to_keyframes_refuses_a_zero_frame_duration() {
+    let (mut s, l) = setup();
+    s.execute("prop.setExpression", json!({"layer": l, "path": "transform/rotation", "expression": "value"})).unwrap();
+    // A saved frame rate of 0/1 s has a frame duration of 0: the sampling loop never advanced.
+    let cid = s.active_comp_id().unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().frame_rate.den = 0;
+    let e = s.execute("prop.convertExpressionToKeyframes", json!({"layer": l, "path": "transform/rotation"})).unwrap_err().to_string();
+    assert!(e.contains("frame duration"), "{e}");
+    assert!(prop(&s, l, "transform/rotation").keys.is_empty());
 }

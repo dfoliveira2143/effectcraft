@@ -1,11 +1,12 @@
 //! Host information for Settings ▸ Memory & CPU (RAM reserved for other applications, reducing
-//! caches when the system is low on memory) and Help ▸ System Compatibility Report.
+//! caches when the system is low on memory), the disk cache's free-space reserve and Help ▸
+//! System Compatibility Report.
 //!
 //! Pure Rust and dependency-free: the values come from the operating system's own reporting
-//! (`/proc/meminfo` on Linux, `sysctl`/`vm_stat` on macOS, `wmic`/PowerShell on Windows). Every
-//! query may fail (sandboxes, the web): callers treat `None` as "unknown" and keep their
-//! configured budgets. The periodic reading behind the cache budgets runs on a background
-//! thread ([`MemoryWatch`]): on Windows it starts PowerShell, which takes about a second.
+//! (`/proc/meminfo` on Linux, `sysctl`/`vm_stat` on macOS, `df` on Unix, `wmic`/PowerShell on
+//! Windows). Every query may fail (sandboxes, the web): callers treat `None` as "unknown" and
+//! keep their configured budgets. The periodic readings behind the cache budgets run on a
+//! background thread ([`Watch`]): on Windows they start PowerShell, which takes about a second.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -27,47 +28,74 @@ impl SysMemory {
     }
 }
 
-/// The system's memory, read in the background: [`MemoryWatch::poll`] starts a reading (unless
-/// one is running) and [`MemoryWatch::latest`] returns the last one without waiting.
-#[derive(Clone, Default)]
-pub struct MemoryWatch {
-    latest: Arc<Mutex<Option<SysMemory>>>,
+/// A system value read in the background: [`Watch::poll_with`] starts a reading (unless one is
+/// running) and [`Watch::latest`] returns the last one without waiting.
+#[derive(Clone)]
+pub struct Watch<T> {
+    latest: Arc<Mutex<Option<T>>>,
     busy: Arc<AtomicBool>,
 }
 
-impl MemoryWatch {
-    /// Start a new reading in the background (no threads on the web: read inline, it is
-    /// unknown there anyway).
-    pub fn poll(&self) {
+impl<T> Default for Watch<T> {
+    fn default() -> Self {
+        Watch { latest: Arc::new(Mutex::new(None)), busy: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+/// The system's memory ([`memory`]).
+pub type MemoryWatch = Watch<SysMemory>;
+/// The disk cache's free-space reading ([`disk_space`]): the reader applies it to its cache
+/// itself, so only the busy guard is used.
+pub type DiskWatch = Watch<()>;
+
+impl<T: Copy + Send + 'static> Watch<T> {
+    /// Start a new reading in the background on a thread called `name` (no threads on the web:
+    /// read inline, it is unknown there anyway).
+    pub fn poll_with(&self, name: &str, read: impl FnOnce() -> Option<T> + Send + 'static) {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
         let (latest, busy) = (self.latest.clone(), self.busy.clone());
         let read = move || {
-            if let Some(m) = memory() {
-                *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(m);
-            }
+            // A failed reading clears the last one: a stale value is worse than none.
+            *latest.lock().unwrap_or_else(PoisonError::into_inner) = read();
             busy.store(false, Ordering::Release);
         };
         #[cfg(not(target_arch = "wasm32"))]
-        if std::thread::Builder::new().name("ec-memory".into()).spawn(read).is_err() {
+        if std::thread::Builder::new().name(name.into()).spawn(read).is_err() {
             self.busy.store(false, Ordering::Release);
         }
         #[cfg(target_arch = "wasm32")]
-        read();
+        {
+            let _ = name;
+            read();
+        }
     }
 
-    /// The last reading (`None` until one finished).
-    pub fn latest(&self) -> Option<SysMemory> {
+    /// The last reading (`None` until one finished or when the last one failed).
+    pub fn latest(&self) -> Option<T> {
         *self.latest.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl MemoryWatch {
+    /// Start a new reading of the system's memory in the background.
+    pub fn poll(&self) {
+        self.poll_with("ec-memory", memory);
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
+    run_env(cmd, args, &[])
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+fn run_env(cmd: &str, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Option<String> {
     let mut c = std::process::Command::new(cmd);
-    c.args(args);
+    c.args(args).envs(env.iter().copied());
     // A console program started from the windowed app would flash a console window.
     #[cfg(target_os = "windows")]
     std::os::windows::process::CommandExt::creation_flags(&mut c, 0x0800_0000); // CREATE_NO_WINDOW
@@ -137,6 +165,115 @@ pub fn memory() -> Option<SysMemory> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+/// Parse `df -Pk` output: the disk's total and available bytes.
+pub fn parse_df(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().skip(1).find(|l| !l.trim().is_empty())?;
+    let f: Vec<&str> = line.split_whitespace().collect();
+    // A full disk into its root-reserved blocks reports negative numbers (Linux): none free.
+    let num = |v: &str| match v.strip_prefix('-') {
+        Some(d) => d.parse::<u64>().ok().map(|_| 0),
+        None => v.parse::<u64>().ok(),
+    };
+    // Size, used, available and capacity follow the device name (which may contain spaces).
+    let i = (0..f.len().saturating_sub(3))
+        .find(|&i| f.get(i + 3).is_some_and(|c| c.ends_with('%')) && f.get(i..i + 3).is_some_and(|n| n.iter().all(|v| num(v).is_some())))?;
+    let kb = |j: usize| f.get(j).and_then(|v| num(v)).map(|v| v.saturating_mul(1024));
+    Some((kb(i)?, kb(i + 2)?))
+}
+
+/// Total and available bytes of the disk holding `path`, when the system reports them.
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    {
+        return parse_df(&run("df", &["-Pk", &path.to_string_lossy()])?);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // The path goes through the environment: no quoting.
+        let text = run_env(
+            "powershell",
+            &["-NoProfile", "-Command", "$d=[IO.DriveInfo]::new($env:EC_DISK_PATH); \"$($d.TotalSize) $($d.AvailableFreeSpace)\""],
+            &[("EC_DISK_PATH", path.as_os_str())],
+        )?;
+        let mut it = text.split_whitespace().filter_map(|v| v.parse::<u64>().ok());
+        return Some((it.next()?, it.next()?));
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Whether `path` is on a RAM-backed filesystem (`tmpfs`/`ramfs`), where bytes written count
+/// against memory as well as space. Linux reads `/proc/self/mountinfo`; other systems report
+/// `false` (their temporary folders are disk-backed by default). `path` may not exist yet: its
+/// nearest existing ancestor decides, as when the fill creates its scratch folder.
+pub fn is_memory_backed(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(canonical) = canonical_ancestor(path) else { return false };
+        return std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|mountinfo| mountinfo_is_memory_backed(&mountinfo, &canonical));
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// The canonical path of `path`'s nearest existing ancestor (or itself). Relative paths are
+/// resolved against the current directory first, so a new relative output folder still names
+/// the volume it will be created on.
+#[cfg(target_os = "linux")]
+fn canonical_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().ok()?.join(path) };
+    let mut p = absolute.as_path();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(p) {
+            return Some(canonical);
+        }
+        p = p.parent()?;
+    }
+}
+
+/// Whether a `/proc/self/mountinfo` listing mounts `path` on `tmpfs` or `ramfs`; the deepest
+/// matching mount point wins, and a later entry at the same mount point is the visible one.
+#[cfg(target_os = "linux")]
+pub(crate) fn mountinfo_is_memory_backed(mountinfo: &str, path: &std::path::Path) -> bool {
+    let mut best: Option<(usize, &str)> = None;
+    for line in mountinfo.lines() {
+        let Some(mount) = line.split_whitespace().nth(4) else { continue };
+        let Some(fstype) = line.split(" - ").nth(1).and_then(|rest| rest.split_whitespace().next()) else { continue };
+        let mount = unescape_mount(mount);
+        if path.starts_with(&mount) && best.is_none_or(|(longest, _)| mount.len() >= longest) {
+            best = Some((mount.len(), fstype));
+        }
+    }
+    matches!(best, Some((_, "tmpfs" | "ramfs")))
+}
+
+/// Undo mountinfo's octal escapes (`\040` space, `\011` tab, `\012` newline, `\134` backslash).
+#[cfg(target_os = "linux")]
+fn unescape_mount(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && chars.clone().take(3).count() == 3
+            && let Ok(code) = u8::from_str_radix(&chars.clone().take(3).collect::<String>(), 8)
+        {
+            for _ in 0..3 {
+                chars.next();
+            }
+            out.push(code as char);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// CPU model name.
@@ -226,6 +363,42 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_reading_clears_the_last_one() {
+        let w = Watch::<u64>::default();
+        let wait = || {
+            for _ in 0..500 {
+                if !w.busy.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            panic!("the reading never finished");
+        };
+        w.poll_with("ec-test", || Some(7));
+        wait();
+        assert_eq!(w.latest(), Some(7));
+        w.poll_with("ec-test", || None);
+        wait();
+        assert_eq!(w.latest(), None);
+    }
+
+    #[test]
+    fn parses_df() {
+        let linux = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n/dev/nvme0n1p2   488281250 123456789 364824461      26% /\n";
+        assert_eq!(parse_df(linux), Some((488_281_250 * 1024, 364_824_461 * 1024)));
+        // macOS: a device name with spaces and a mount point with spaces.
+        let mac = "Filesystem 1024-blocks Used Available Capacity  Mounted on\nmap auto_home 0 0 0 100% /System/Volumes/Data/home\n";
+        assert_eq!(parse_df(mac), Some((0, 0)));
+        let spaced = "Filesystem 1024-blocks Used Available Capacity Mounted on\n//nas/My Share 1000 400 600 40% /Volumes/My Share\n";
+        assert_eq!(parse_df(spaced), Some((1000 * 1024, 600 * 1024)));
+        // A full disk into its reserved blocks: nothing available.
+        let full = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda2 1000 1010 -10 101% /\n";
+        assert_eq!(parse_df(full), Some((1000 * 1024, 0)));
+        assert_eq!(parse_df("Filesystem 1024-blocks\n"), None);
+        assert_eq!(parse_df(""), None);
+    }
+
+    #[test]
     fn parses_proc_meminfo_and_vm_stat() {
         let m = parse_meminfo("MemTotal:       16000000 kB\nMemFree:  1000 kB\nMemAvailable:    8000000 kB\n").unwrap();
         assert_eq!(m, SysMemory { total: 16_000_000 * 1024, available: 8_000_000 * 1024 });
@@ -234,5 +407,43 @@ mod tests {
         let m = parse_vm_stat(vm, 8 << 30).unwrap();
         assert_eq!(m.available, 4100 * 16384);
         assert!(m.is_low());
+    }
+
+    /// The default temp folder may be a `tmpfs`; a nested disk mount under `/tmp` or a nested
+    /// `tmpfs` must be resolved to the deepest mount point.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_finds_memory_backed_storage() {
+        let mountinfo = "\
+25 1 0:22 / / rw,relatime - ext4 /dev/nvme0n1p2 rw
+26 25 0:23 / /tmp rw,nosuid - tmpfs tmpfs rw
+27 25 0:24 / /tmp/disk rw - ext4 /dev/sda1 rw
+28 25 0:25 / /mnt/ram rw - ramfs none rw
+29 25 0:26 / /media/My\\040Disk rw - ext4 /dev/sdb1 rw
+";
+        assert!(mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/tmp/effectcraft-fill")));
+        assert!(!mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/tmp/disk/fill")));
+        assert!(mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/mnt/ram/a")));
+        assert!(!mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/home/fill")));
+        assert!(!mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/")));
+        // A path that merely shares a prefix is not on that mount.
+        assert!(!mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/tmpdisk/fill")));
+        // Escaped spaces in a mount point decode before matching.
+        assert!(!mountinfo_is_memory_backed(mountinfo, std::path::Path::new("/media/My Disk/fill")));
+        assert_eq!(unescape_mount("/media/My\\040Disk"), "/media/My Disk");
+        // The later entry at the same mount point is the visible mount: a disk mount stacked on
+        // a tmpfs is disk-backed, and the reverse order is memory-backed (#2570 review).
+        let stacked_disk = "\
+30 25 0:30 / /tmp/stack rw - tmpfs tmpfs rw
+31 25 0:31 / /tmp/stack rw - ext4 /dev/sdb2 rw
+";
+        let stacked_ram = "\
+30 25 0:30 / /tmp/stack rw - ext4 /dev/sdb2 rw
+31 25 0:31 / /tmp/stack rw - tmpfs tmpfs rw
+";
+        assert!(!mountinfo_is_memory_backed(stacked_disk, std::path::Path::new("/tmp/stack/fill")));
+        assert!(mountinfo_is_memory_backed(stacked_ram, std::path::Path::new("/tmp/stack/fill")));
+        // A new relative folder resolves against the current directory before walking up.
+        assert!(canonical_ancestor(std::path::Path::new("no-such-relative-folder/fill")).is_some());
     }
 }

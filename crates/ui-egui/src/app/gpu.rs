@@ -1,4 +1,11 @@
-use super::*;
+use super::{Arc, EffectcraftApp, RenderSource, gpu_failure, menus, panels};
+
+/// The status line while the GPU compositor's worker thread is still building its pipelines
+/// (see [`EffectcraftApp::init_gpu`]).
+pub const GPU_PREPARING: &str = "Preparing the GPU compositor… (compositing on the CPU until it is ready)";
+/// What the compositor's worker thread hands back: the compositor, why the device can't run it,
+/// or the payload of a panic in the graphics backend.
+pub type GpuBuild = std::thread::Result<Result<effectcraft_gpu::Gpu, String>>;
 
 impl EffectcraftApp {
     pub fn render_source(&self) -> RenderSource {
@@ -37,6 +44,9 @@ impl EffectcraftApp {
     pub fn set_gpu_failure_bridge(&mut self, bridge: gpu_failure::GpuFailureBridge) {
         if let Some(gpu) = &self.gpu {
             bridge.forward_to(gpu.context().device_failure_notifier());
+            if let Some(observer) = bridge.scoped_error_observer() {
+                gpu.set_scoped_error_observer(observer);
+            }
         }
         self.gpu_failures = Some(bridge);
     }
@@ -66,14 +76,30 @@ impl EffectcraftApp {
                 renderer.free_texture(id);
             }
             for (_, texture) in self.passive_tex.values() {
-                if let panels::viewers::PassiveTexture::Gpu(id, _) = texture {
-                    renderer.free_texture(id);
+                match texture {
+                    panels::viewers::PassiveTexture::Gpu(id, _) => renderer.free_texture(id),
+                    panels::viewers::PassiveTexture::Baked(b) => {
+                        if let Some(id) = b.id() {
+                            renderer.free_texture(&id);
+                        }
+                    }
+                    panels::viewers::PassiveTexture::Cpu(_) => {}
                 }
             }
+            drop(renderer);
         }
+        // The display pass's textures: half-float frames go through the CPU from now on.
+        self.viewer_bake.free(self.window_wgpu.as_ref());
+        self.snapshot_bake.free(self.window_wgpu.as_ref());
+        self.display_gpu = None;
+        self.window_wgpu = None;
         self.viewer_native = None;
         self.passive_tex.retain(|_, (_, texture)| matches!(texture, panels::viewers::PassiveTexture::Cpu(_)));
-        self.viewer_shown = self.viewer_tex.as_ref().map(|(texture, key, _)| (texture.id(), *key));
+        self.viewer_shown = match &self.viewer_f16 {
+            // A half-float frame stays on screen through the CPU pass.
+            Some(_) => self.viewer_shown.map(|(_, key)| (None, key)),
+            None => self.viewer_tex.as_ref().map(|(texture, key, _)| (Some(texture.id()), *key)),
+        };
         self.viewer_image = None;
         // Old completion closures retain only their detached slot, not the replacement.
         self.viewer_readback = Default::default();
@@ -124,7 +150,19 @@ impl EffectcraftApp {
 
     /// Set up the GPU compositor on egui-wgpu's device (once). Without an adapter that runs
     /// compute shaders (WebGL2, software GL) everything stays on the CPU.
-    pub(crate) fn init_gpu(&mut self, frame: &eframe::Frame) {
+    ///
+    /// On the desktop the compositor is built on a worker thread. Its compute pipelines (about
+    /// 235 of them) take tens of seconds to compile on a cold shader cache (first launch, after
+    /// an OS update, after an update that changed a shader), and eframe shows the window only
+    /// once the first frame has painted, so building them here kept the window from appearing
+    /// at all. Until the worker is done the viewer composites on the CPU, as it does without a
+    /// GPU, and the status bar says so; the browser has no threads and builds it in place.
+    pub(crate) fn init_gpu(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.gpu_build.is_some() {
+            self.finish_gpu_build(frame.wgpu_render_state());
+            return;
+        }
         if self.gpu_checked {
             return;
         }
@@ -133,6 +171,9 @@ impl EffectcraftApp {
             return;
         }
         let Some(rs) = frame.wgpu_render_state() else { return };
+        // The display pass needs only this device, not the compositor (which may take tens of
+        // seconds to build, or fail).
+        self.window_wgpu = Some(rs.clone());
         // Help ▸ System Compatibility Report names the adapter and backend the window got.
         let info = rs.adapter.get_info();
         self.session.window_adapter = Some(format!(
@@ -142,18 +183,96 @@ impl EffectcraftApp {
             info.device_type,
             if info.driver.is_empty() { String::new() } else { format!(", {} {}", info.driver, info.driver_info) }
         ));
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.spawn_gpu_build(ctx, rs) {
+            return;
+        }
+        // In place (the browser, or no thread to be had): nothing to wake later.
+        let _ = ctx;
         // Backend validation can panic on shader compilation even when device creation
         // succeeded. Keep the document and the egui renderer, and use CPU compositing.
-        let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| effectcraft_gpu::Gpu::new(&rs.adapter, rs.device.clone(), rs.queue.clone())));
-        match gpu {
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| effectcraft_gpu::Gpu::new(&rs.adapter, rs.device.clone(), rs.queue.clone())));
+        self.attach_gpu(built, Some(rs));
+    }
+
+    /// Start building the compositor on a `gpu-compositor` worker thread, which hands its result
+    /// back to [`Self::finish_gpu_build`] and wakes the UI. False when no thread could be spawned
+    /// (the caller then builds it in place).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_gpu_build(&mut self, ctx: &egui::Context, rs: &eframe::egui_wgpu::RenderState) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (adapter, device, queue) = (rs.adapter.clone(), rs.device.clone(), rs.queue.clone());
+        let gate = self.hooks.before_gpu_build.take();
+        let wake = ctx.clone();
+        let spawned = std::thread::Builder::new().name("gpu-compositor".into()).spawn(move || {
+            // Backend validation can panic on shader compilation even when device creation
+            // succeeded: the panic stays on this thread and arrives as a result.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(gate) = gate {
+                    gate();
+                }
+                effectcraft_gpu::Gpu::new(&adapter, device, queue)
+            }));
+            // No receiver: the window closed, or the device failed, while this was running.
+            let _ = tx.send(built);
+            wake.request_repaint();
+        });
+        if let Err(e) = spawned {
+            log::warn!("no worker thread for the GPU compositor ({e}); building it on the UI thread");
+            return false;
+        }
+        self.gpu_build = Some(rx);
+        self.session.accel_note = Some(GPU_PREPARING.into());
+        if self.ui.status.is_empty() {
+            self.ui.status = GPU_PREPARING.into();
+        }
+        true
+    }
+
+    /// Take the worker's result when it has arrived ([`Self::init_gpu`]). `rs`: the window's
+    /// device, which a compositor that built is attached to.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_gpu_build(&mut self, rs: Option<&eframe::egui_wgpu::RenderState>) {
+        let Some(rx) = &self.gpu_build else { return };
+        let built = match rx.try_recv() {
+            Ok(built) => built,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(Box::new("the compositor's worker thread ended without a result") as Box<dyn std::any::Any + Send>)
+            }
+        };
+        self.gpu_build = None;
+        if self.ui.status == GPU_PREPARING {
+            self.ui.status.clear();
+        }
+        // The device failed while the compositor was being built: it stays detached, and
+        // `apply_gpu_failure` has already said why the viewer is on the CPU.
+        if self.gpu_failure_applied.is_some() || self.gpu_failures.as_ref().is_some_and(|bridge| bridge.failure().is_some()) {
+            return;
+        }
+        self.attach_gpu(built, rs);
+    }
+
+    /// Attach a built compositor to the viewer, or record why there is none. Keeps the document
+    /// and the egui renderer either way; without a compositor the viewer composites on the CPU.
+    fn attach_gpu(&mut self, built: GpuBuild, rs: Option<&eframe::egui_wgpu::RenderState>) {
+        match built {
             Ok(Ok(g)) => {
                 if let Some(bridge) = &self.gpu_failures {
                     bridge.forward_to(g.context().device_failure_notifier());
+                    if let Some(observer) = bridge.scoped_error_observer() {
+                        g.set_scoped_error_observer(observer);
+                    }
                     if bridge.failure().is_some() {
                         return;
                     }
                 }
+                let Some(rs) = rs else {
+                    self.session.accel_note = Some("GPU compositor unavailable: the window has no wgpu device".into());
+                    return;
+                };
                 log::info!("GPU compositor: {}", effectcraft_engine::render::Accelerator::name(&g));
+                self.session.accel_note = None;
                 self.session.accel = Some(Arc::new(g.clone()));
                 self.gpu = Some(g);
                 self.wgpu = Some(rs.clone());
@@ -167,6 +286,19 @@ impl EffectcraftApp {
                 log::warn!("GPU compositor setup failed; using CPU compositing: {reason}");
                 self.session.accel_note = Some(format!("GPU compositor setup failed: {reason}"));
             }
+        }
+    }
+
+    /// Whether the GPU compositor is still being built on its worker thread (the viewer is on
+    /// the CPU meanwhile). Always false in the browser, which builds it with the first frame.
+    pub fn gpu_initializing(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.gpu_build.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
         }
     }
 
@@ -184,6 +316,7 @@ impl EffectcraftApp {
 #[cfg(test)]
 mod gpu_failure_tests {
     use super::*;
+    use crate::{FrameKey, ItemId, RenderOpts, Session, Tick, json};
 
     #[test]
     fn host_failure_preserves_document_undo_and_cpu_pixels_and_detaches_late_readbacks() {

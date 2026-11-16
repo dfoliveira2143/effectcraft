@@ -6,7 +6,7 @@
 //! Positions are character indices. The selection is `anchor..caret` (either order).
 
 use effectcraft_keyframe::{CharStyle, TextDoc, Value as KV};
-use effectcraft_project::{ItemId, LayerId, LayerSource};
+use effectcraft_project::{ItemId, LayerId, LayerSource, text_layer_name};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -71,7 +71,8 @@ pub struct TextEdit {
     /// Character panel changes made with only a caret: the style the next typed text takes.
     #[serde(default)]
     pub pending: Option<CharStyle>,
-    /// The layer was made by a Type tool click; leaving it empty deletes it.
+    /// The layer was made by a Type tool click. Kept when left empty, as After Effects does, so this
+    /// only records how the edit began.
     #[serde(default)]
     pub created: bool,
     /// Line position kept by repeated up / down moves (layout space).
@@ -287,10 +288,6 @@ fn session_on(s: &mut Session, lid: LayerId) -> TextEdit {
     }
 }
 
-fn first_line_name(text: &str) -> String {
-    text.lines().next().unwrap_or("").chars().take(40).collect()
-}
-
 /// Edit a layer's Source Text at the CTI (one undo step, or merged by `merge`), then set the
 /// session's selection.
 pub(crate) fn edit_doc(
@@ -318,12 +315,13 @@ pub(crate) fn edit_doc(
         // already has) must not turn a static Str into Text or add a keyframe at the CTI: that
         // would change the project and record an empty undo step.
         if doc != original {
-            let before = first_line_name(&original.text);
-            let after = first_line_name(&doc.text);
+            let before = text_layer_name(&original.text);
+            let after = text_layer_name(&doc.text);
             pr.set_value_at(lt, KV::Text(Box::new(doc)));
-            // Text layers are named after their text until renamed.
-            if before != after && !after.is_empty() && (l.name == before || l.name.starts_with("Text") || l.name.is_empty()) {
+            // Text layers are named after their text until renamed (#3233).
+            if before != after && !after.is_empty() && l.name_follows_text(&before) {
                 l.name = after;
+                l.name_follows_text = Some(true);
             }
         }
         Ok(())
@@ -372,18 +370,14 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(state_json(s))
 }
 
-/// `text.endEdit`: stop editing (a Type-tool layer left empty is deleted).
+/// `text.endEdit`: stop editing.
+///
+/// A Type-tool layer the user clicked away from without typing is **kept**: After Effects leaves it in
+/// the timeline as `<空白のテキストレイヤー>`, and the layer came from the user's click rather than from a
+/// mistake to clean up. Deleting it took away something they could still type into.
 pub(crate) fn end_edit(s: &mut Session, _: &Value) -> Result<Value> {
-    let Some(e) = s.state.text_edit.take() else { return Ok(Value::Null) };
-    if e.created && layer_doc(s, e.layer).is_some_and(|d| d.text.is_empty()) {
-        let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
-        s.edit("Delete Empty Text Layer", None, |proj, st| {
-            if let Some(c) = proj.comp_mut(cid) {
-                c.layers.retain(|l| l.id != e.layer);
-            }
-            st.selected_layers.retain(|l| *l != e.layer);
-            Ok(())
-        })?;
+    if s.state.text_edit.take().is_none() {
+        return Ok(Value::Null);
     }
     s.bump();
     Ok(Value::Null)

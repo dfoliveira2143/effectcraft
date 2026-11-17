@@ -1,5 +1,5 @@
 use super::choices::theme_family;
-use super::*;
+use super::{BTreeMap, Deserialize, Label, Serialize, Value};
 
 /// Unknown keys inside a page, kept so a newer version's settings survive a round trip.
 pub(super) type Extra = BTreeMap<String, Value>;
@@ -31,8 +31,14 @@ page!(General {
     /// Path Point and Handle Size (px).
     path_point_size: u32 = 5,
     show_tool_tips: bool = true,
+    /// Step frames with an unmodified mouse wheel over the Composition viewer.
+    /// Off: the wheel zooms, which is what current After Effects does.
+    viewer_wheel_scrubbing: bool = false,
     /// Create New Layers at Composition Start Time (off: at the current time).
     create_layers_at_comp_start: bool = true,
+    /// Fit New Layers to Work Area: new text, solid, shape, null and adjustment layers span the
+    /// work area instead of the whole composition (off, as in After Effects).
+    fit_new_layers_to_work_area: bool = false,
     switches_affect_nested_comps: bool = true,
     /// Default Spatial Interpolation to Linear.
     default_spatial_linear: bool = false,
@@ -62,6 +68,9 @@ page!(ProjectPrefs {
     /// Open a template project for File ▸ New ▸ New Project.
     use_template: bool = false,
     template_path: String = String::new(),
+    /// Write `.ecproj` files as compact JSON on one line (smaller, faster to save and open). Off:
+    /// indented, one value per line, so they read and diff cleanly in version control.
+    compact_project_files: bool = false,
 });
 
 page!(AutoSave {
@@ -86,8 +95,14 @@ page!(CompositionPrefs {
 page!(Previews {
     /// Largest downsampling while playing back: `1/2`, `1/4`, `1/8`.
     adaptive_resolution_limit: String = "1/8".into(),
+    /// A preview at Resolution Auto that renders slower than real time steps down a resolution
+    /// (½, then ¼, no further than the Adaptive Resolution Limit) for the rest of that play. Off
+    /// by default: it never steps back up during a play, so a looping preview kept playing at ¼
+    /// after its first loop, where without it the first loop caches Full and the next ones play
+    /// in real time at Full, as in After Effects.
+    adaptive_playback: bool = false,
     show_internal_wireframes: bool = false,
-    cache_frames_when_idle: bool = false,
+    cache_frames_when_idle: bool = true,
     fast_previews: bool = false,
     /// `faster` or `moreAccurate`.
     zoom_quality: String = "moreAccurate".into(),
@@ -150,7 +165,8 @@ page!(Import {
     sequence_fps: f64 = 30.0,
     report_missing_frames: bool = true,
     /// Automatically Reload Footage whose file another app changed (size or modification time),
-    /// checked every two seconds and when the window comes back to the front: `off`,
+    /// checked every two seconds while the window is in front, every ten seconds while it is
+    /// not, and when it comes back to the front: `off`,
     /// `nonSequence` (the default, as in After Effects: image sequences are left alone) or `all`.
     auto_reload_footage: String = "nonSequence".into(),
     /// Interpret unlabeled alpha as: `ask`, `guess`, `ignore`, `straight`, `premultiplied`.
@@ -179,7 +195,7 @@ page!(Audio {
 
 page!(Disk {
     disk_cache_enabled: bool = true,
-    disk_cache_max_gb: u32 = 100,
+    disk_cache_max_gb: u32 = 20,
     disk_cache_folder: String = String::new(),
     media_cache_folder: String = String::new(),
     conformed_media_folder: String = String::new(),
@@ -194,7 +210,23 @@ page!(Memory {
     /// RAM preview (viewer frame) cache budget (MB).
     preview_cache_mb: u32 = 3072,
     reduce_cache_when_low: bool = true,
+    /// GPU Frames Rendered at Once (Render Queue): `auto` (from the GPU memory a frame
+    /// measured, 1 to 3) or `1`, `2`, `3`. `EFFECTCRAFT_GPU_INFLIGHT` overrides it.
+    gpu_frames_in_flight: String = "auto".into(),
 });
+
+impl Memory {
+    /// [`Memory::gpu_frames_in_flight`] as a count: 1 to 3, or `None` for Auto (and anything
+    /// else, as a hand-edited settings file may hold).
+    pub fn gpu_frames(&self) -> Option<usize> {
+        match self.gpu_frames_in_flight.trim() {
+            "1" => Some(1),
+            "2" => Some(2),
+            "3" => Some(3),
+            _ => None,
+        }
+    }
+}
 
 page!(Video {
     enable_output: bool = false,

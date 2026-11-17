@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, EditorState, EngineError, Event, History, ItemId, Project, Result, Session, camera_track, commands, roto, warp};
 
 impl Session {
     /// Apply an undoable edit. `merge`: consecutive edits with the same key fold into one step.
@@ -30,6 +30,9 @@ impl Session {
     /// undo step under `label`, unless it merges with the current merge key (then the redo branch
     /// is dropped). An `Err` from `f` propagates with the session unchanged.
     fn edit_inner<T>(&mut self, label: &str, merge: Option<&str>, f: impl FnOnce(&mut Project, &mut EditorState) -> Result<T>) -> Result<T> {
+        if self.script_ui.render_host.is_some() {
+            return Err(EngineError::Other(crate::scriptui::RENDER_WAIT_MESSAGE.into()));
+        }
         let before = self.project.clone();
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
@@ -91,50 +94,23 @@ impl Session {
 
     pub fn bump(&mut self) {
         self.revision += 1;
+        // A Cryptomatte probe is keyed by the revision: an older one never answers again.
+        self.drop_crypto_probe();
         // Back at the saved state (undo, redo, a history jump or a rolled-back batch).
         if Arc::ptr_eq(&self.project, &self.saved_project) {
             self.saved_revision = self.revision;
         }
-        self.refresh_disk_salt(false);
+        self.refresh_aux_footage();
         self.events.push(Event::ProjectChanged { revision: self.revision });
-    }
-
-    /// Salt the disk cache's layer keys with the project's footage files
-    /// ([`effectcraft_render::disk_cache::footage_salt`]). Taking it reads the size and time of
-    /// every file, every frame of an image sequence included, so it is taken again only when the
-    /// footage items changed, or with `force` (a project opened, footage reloaded, the disk cache
-    /// attached), not at every edit: with a few large sequences that cost each keystroke in a
-    /// text field over half a second (#1926).
-    pub fn refresh_disk_salt(&mut self, force: bool) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
-        if self.disk_cache.is_none() {
-            self.disk_salt = None;
-            return None;
-        }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for (id, it) in &self.project.items {
-            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
-                id.hash(&mut h);
-                format!("{f:?}").hash(&mut h);
-            }
-        }
-        let footage = h.finish();
-        if let Some((seen, salt)) = self.disk_salt
-            && seen == footage
-            && !force
-        {
-            return Some(salt);
-        }
-        let salt = effectcraft_render::disk_cache::footage_salt(&self.project);
-        self.disk_salt = Some((footage, salt));
-        self.layer_cache.set_disk_salt(salt);
-        Some(salt)
     }
 
     /// Set a comp's Resolution. As in After Effects it is saved with the project (which becomes
     /// modified) but is no undo step, and it changes no pixels: the comp's cached frames stay
     /// valid ([`effectcraft_project::Comp::same_pixels`]).
     pub fn set_resolution(&mut self, comp: ItemId, r: effectcraft_project::Resolution) -> Result<()> {
+        if self.script_ui.render_host.is_some() {
+            return Err(EngineError::Other(crate::scriptui::RENDER_WAIT_MESSAGE.into()));
+        }
         if self.project.comp(comp).ok_or(EngineError::NoComp)?.resolution == r {
             return Ok(());
         }
@@ -164,14 +140,19 @@ impl Session {
     /// on-canvas editor gets a new IME epoch only when its own document changed) and the session is
     /// bumped. Returns `false`, changing nothing, when there is nothing to undo.
     pub fn undo(&mut self) -> bool {
+        if self.script_ui.render_host.is_some() {
+            return false;
+        }
         let Some((label, p)) = self.history.undo.pop() else { return false };
         let edited = commands::text_edit::active_editor_snapshot(self);
+        let probe = commands::kept_crypto_probe(self);
         let cur = std::mem::replace(&mut self.project, p);
         self.keep_view_settings(&cur);
-        self.history.redo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_after_replacement(edited.as_ref());
         self.bump();
+        commands::keep_crypto_probe(self, probe, &cur);
+        self.history.redo.push((label, cur));
         true
     }
 
@@ -180,14 +161,19 @@ impl Session {
     /// text document starts a new IME epoch) and the session is bumped. Returns `false`, changing
     /// nothing, when there is nothing to redo.
     pub fn redo(&mut self) -> bool {
+        if self.script_ui.render_host.is_some() {
+            return false;
+        }
         let Some((label, p)) = self.history.redo.pop() else { return false };
         let edited = commands::text_edit::active_editor_snapshot(self);
+        let probe = commands::kept_crypto_probe(self);
         let cur = std::mem::replace(&mut self.project, p);
         self.keep_view_settings(&cur);
-        self.history.undo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_after_replacement(edited.as_ref());
         self.bump();
+        commands::keep_crypto_probe(self, probe, &cur);
+        self.history.undo.push((label, cur));
         true
     }
 
@@ -210,6 +196,9 @@ impl Session {
 
     /// Replace the whole project (open/new), resetting history and state.
     pub fn replace_project(&mut self, mut p: Project, path: Option<String>) {
+        // Work still running for the closed project stops reading it (see `project_closed`).
+        self.project_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.project_closed = Arc::default();
         if self.stop_render()
             && let Some(mut job) = self.render_job.take()
         {
@@ -235,22 +224,25 @@ impl Session {
         self.script_ui.project_epoch = self.script_ui.project_epoch.wrapping_add(1);
         p.fix_next_id();
         upgrade_effects(&mut p);
-        // The media layer keys decoded frames by path: files of the new project may have changed
-        // since an earlier project decoded them (#1070).
-        for it in p.items.values() {
-            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
-                self.forget_decoded(f);
-            }
+        // Let go of what the closed project's footage and proxies decoded (frames, decoders,
+        // models), and of what the new project's files decoded under an earlier project: the
+        // media layer keys them by path, and the files may have changed since (#1070).
+        for f in super::render::project_footage(&self.project).chain(super::render::project_footage(&p)) {
+            super::render::forget_files(self.footage.as_ref(), f);
         }
+        self.drop_crypto_probe();
         self.layer_cache.clear();
         self.project = Arc::new(p);
-        // Its files may have changed since they were last stamped.
-        self.disk_salt = None;
+        // The set of footage effects read the channels of is sent again, even when it is empty.
+        self.aux_footage = None;
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
         self.bump();
         self.mark_saved();
+        // The viewers' RAM preview shows the closed project's frames, whose comp ids can collide
+        // with the new project's.
+        self.events.push(Event::PurgeCaches);
         let first = self.project.comps().next().map(|(id, _)| *id);
         if let Some(c) = first {
             self.open_comp(c);
@@ -262,7 +254,9 @@ impl Session {
 /// (renamed / regrouped / added parameters, reordered popups; see
 /// [`effectcraft_effects::migrate`]), and a project from before
 /// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
-/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Shape path operations get the
+/// properties added since ([`effectcraft_project::build::upgrade_shape_contents`]). Stamps the
+/// current schema.
 pub fn upgrade_effects(p: &mut Project) {
     let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
     // Effect bounds per layer: (size, top-left in layer coordinates).
@@ -285,6 +279,9 @@ pub fn upgrade_effects(p: &mut Project) {
                 Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| shift(b.1)),
                 None => d,
             };
+            if let Some(contents) = l.props.sub_mut("contents") {
+                effectcraft_project::build::upgrade_shape_contents(&mut effectcraft_project::build::Ids(&mut next), contents);
+            }
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };

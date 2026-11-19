@@ -27,7 +27,11 @@ mod sections;
 pub use choices::{APPEARANCE_MODES, DARK_THEMES, LANGUAGES, LIGHT_THEMES, THEMES, WINDOW_GRAPHICS, theme_family};
 pub use dialog::{Item, Kind, Page, pages, pages_json, todo_keys};
 pub use document::{migrate, page_id, section_key};
-pub use queries::{CacheBudgets, WEB_LAYER_CACHE, WEB_MEDIA_CACHE, mask_color};
+pub use queries::{
+    CacheCaps, FALLBACK_MEMORY_BUDGET, MEMORY_HEADROOM_PERCENT, MIN_MEMORY_BUDGET, MemoryBudget, PROCESS_PURGE_PERCENT, WEB_LAYER_CACHE, WEB_MEDIA_CACHE,
+    WEB_MEMORY_BUDGET, WEB_PREVIEW_CACHE, mask_color,
+};
+pub use recent::{MAX_RECENT_SCRIPTS, RecentScript};
 pub use sections::{
     Appearance, Audio, AutoSave, CompPreset, CompositionPrefs, Disk, Export, FacePrefs, General, Grids, Import, LabelPref, Memory, Previews, ProjectPrefs,
     RotoPrefs, Scripting, Startup, ThreeD, TypePrefs, Video,
@@ -35,7 +39,7 @@ pub use sections::{
 use sections::{Extra, default_labels, lenient_comp_presets};
 
 /// Current settings layout version.
-pub const PREFS_VERSION: u32 = 2;
+pub const PREFS_VERSION: u32 = 6;
 /// Settings file name in the config store.
 pub const PREFS_FILE: &str = "prefs.json";
 
@@ -74,6 +78,8 @@ pub struct Prefs {
     /// Animation ▸ Recent Animation Presets (`.ecpreset` paths or built-in preset ids), newest
     /// first.
     pub recent_presets: Vec<String>,
+    /// File ▸ Scripts ▸ Recent Script Files, newest first, at most [`MAX_RECENT_SCRIPTS`].
+    pub recent_scripts: Vec<RecentScript>,
     /// Character panel: recently used font families, newest first.
     pub recent_fonts: Vec<String>,
     /// Effects & Presets: the starred effects' ids, in the order starred.
@@ -117,6 +123,7 @@ impl Default for Prefs {
             recent_projects: vec![],
             recent_footage: vec![],
             recent_presets: vec![],
+            recent_scripts: vec![],
             recent_fonts: vec![],
             effects_favorites: vec![],
             preview: crate::preview::PreviewSettings::default(),

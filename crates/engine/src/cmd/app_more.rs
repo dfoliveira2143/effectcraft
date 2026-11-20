@@ -152,8 +152,9 @@ fn clear_recent_presets(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn save_copy_xml(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.saveCopyAsXml", "missing `path` (.ecprojx)"))?;
-    let xml = crate::xml_project::to_xml(&s.project.to_file_json_with_view(&s.saved_view())?).map_err(EngineError::Other)?;
-    s.services.write_file(path, xml.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
+    s.refuse_export(path)?;
+    let xml = crate::xml_project::to_xml(&s.project.to_file_json_with_view(&s.saved_view(), false)?).map_err(EngineError::Other)?;
+    s.write_output(path, xml.as_bytes())?;
     s.toast(format!("Saved an XML copy to {path}"));
     Ok(json!({"path": path, "bytes": xml.len()}))
 }
@@ -240,7 +241,7 @@ fn replace_with_precomp(s: &mut Session, p: &Value) -> Result<Value> {
             let ids: Vec<ItemId> = proj.items.keys().copied().filter(|c| *c != comp).collect();
             for cid in ids {
                 if let Some(c) = proj.comp_mut(cid) {
-                    for l in c.layers.iter_mut().filter(|l| is_user(l)) {
+                    for l in c.layers.iter_mut_where(|l| is_user(l)) {
                         l.source = LayerSource::Comp { item: comp };
                         n += 1;
                     }
@@ -423,7 +424,8 @@ pub fn system_report(s: &Session) -> Value {
     let gb = |b: u64| format!("{:.1} GB", b as f64 / (1u64 << 30) as f64);
     let export: Vec<&str> = s.exporter.as_ref().map(|e| e.formats().into_iter().map(|f| f.label()).collect()).unwrap_or_default();
     let gpu = s.accel.as_ref().map(|a| a.name());
-    let budgets = s.prefs.cache_budgets(mem.or(s.sys_memory));
+    // (the budget in force: from the reading the session applied, not this fresh one)
+    let budget = s.memory_budget();
     let mut issues = vec![];
     if gpu.is_none() {
         issues.push(match &s.accel_note {
@@ -447,7 +449,7 @@ pub fn system_report(s: &Session) -> Value {
         "gpu": gpu,
         "gpuNote": if gpu.is_none() { s.accel_note.clone() } else { None },
         "windowGraphics": s.window_adapter,
-        "caches": {"layer": gb(budgets.layer as u64), "footage": gb(budgets.media as u64), "preview": gb(budgets.preview as u64)},
+        "caches": {"budget": gb(budget.bytes as u64), "inUse": gb(effectcraft_render::memory::Accountant::global().total() as u64), "reduced": budget.reduced},
         "import": IMPORT_FORMATS,
         "export": export,
         "logging": crate::logging::is_enabled(),
@@ -481,12 +483,7 @@ pub fn report_text(r: &Value) -> String {
         t.push_str(&format!("Window graphics: {w}\n"));
     }
     let c = &r["caches"];
-    t.push_str(&format!(
-        "Cache budgets: layer {}, footage {}, preview {}\n",
-        c["layer"].as_str().unwrap_or("?"),
-        c["footage"].as_str().unwrap_or("?"),
-        c["preview"].as_str().unwrap_or("?")
-    ));
+    t.push_str(&format!("Cache memory: {} in use of {}\n", c["inUse"].as_str().unwrap_or("?"), c["budget"].as_str().unwrap_or("?")));
     t.push_str(&format!("Import: {}\nExport: {}\n", list("import"), list("export")));
     let issues = list("issues");
     t.push_str(&if issues.is_empty() { "No compatibility issues found.".to_string() } else { format!("Issues: {issues}") });

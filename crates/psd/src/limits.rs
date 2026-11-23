@@ -1,4 +1,4 @@
-use super::*;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -103,11 +103,6 @@ impl Budget {
         v.resize(n, value);
         Ok(v)
     }
-}
-
-/// Inflate a zlib stream to at most `limit` bytes.
-pub(crate) fn inflate(src: &[u8], limit: usize) -> Result<Vec<u8>> {
-    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, limit).map_err(|e| Error::Invalid(format!("zip: {e:?}")))
 }
 
 /// Give back what a channel buffer from `Psd::channel_bytes` / `Psd::decode_plane` was charged:

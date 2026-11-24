@@ -172,6 +172,17 @@ fn caps_and_small_caps() {
 }
 
 #[test]
+fn indexed_caret_lookup_matches_a_linear_scan() {
+    let l = layout("fi abc\n\nde fg hi", &st(40.0), &ParagraphStyle::default());
+    for pos in 0..=l.lines.iter().map(|x| x.range.end).max().unwrap_or(0) + 2 {
+        let li = l.lines.iter().enumerate().filter(|(_, x)| x.range.start <= pos).map(|(i, _)| i).next_back().unwrap_or(0);
+        let line = &l.lines[li];
+        let want = line.carets.iter().min_by_key(|(b, _)| b.abs_diff(pos)).map_or(line.x, |c| c.1);
+        assert_eq!(l.caret(pos), (want, line.baseline, li), "pos {pos}");
+    }
+}
+
+#[test]
 fn ligature_caret_interpolates() {
     // Inter has an "fi"-like ligature only via calt in some versions; use "ffi" which most
     // fonts ligate. Whatever shaping does, every char boundary has a caret.
@@ -356,4 +367,186 @@ fn named_instance_sets_the_base_variations() {
     // A static family keeps no variations.
     let inter = layout_uncached("Hi", &TextStyle::default(), &ParagraphStyle::default());
     assert!(inter.glyphs.iter().all(|g| g.variations == 0));
+}
+
+/// After Effects 2026 (case 818): box text's first baseline is the `d` height (in whole
+/// thousandths of an em) below the box top, at the nominal size also for superscript, whose
+/// glyphs are then raised. EffectCraft used the font ascent of the drawn size (plus the
+/// superscript rise): 89.1 px instead of 69.5 for Times New Roman at 100 px, and the
+/// superscript glyphs 15.8 px low.
+#[test]
+fn box_text_first_baseline_is_the_d_height_as_after_effects() {
+    let boxed = ParagraphStyle { width: Some(600.0), ..Default::default() };
+    // The rule on a bundled face (works everywhere).
+    for (family, size) in [("Inter", 100.0f32), ("Noto Serif", 50.0)] {
+        let s = TextStyle { family: family.into(), ..st(size) };
+        let r = fonts::resolve(family, "Regular");
+        let f = fonts::face(r.face);
+        let d = crate::outline_units(r.face, f.glyph('d').unwrap()).unwrap();
+        let em = (kurbo::Shape::bounding_box(&*d).y1 as f32 / f.units_per_em() * 1000.0).round() / 1000.0;
+        let l = layout("Hxg", &s, &boxed);
+        assert!((l.lines[0].baseline - em * size).abs() < 1e-3, "{family}: {} vs {}", l.lines[0].baseline, em * size);
+        assert!(l.lines[0].baseline < l.lines[0].ascent, "{family}: below the full ascent");
+    }
+    // After Effects' numbers, where the real fonts are installed.
+    for (family, ae_normal) in [("Times New Roman", 69.5008f32), ("Arial", 71.5988)] {
+        let r = fonts::resolve(family, "Regular");
+        if fonts::face(r.face).info.family != family {
+            continue;
+        }
+        for (size, script, glyph_baseline) in
+            [(100.0, Script::Normal, ae_normal), (50.0, Script::Normal, ae_normal / 2.0), (100.0, Script::Super, ae_normal - 100.0 * SCRIPT_OFFSET)]
+        {
+            let s = TextStyle { family: family.into(), script, ..st(size) };
+            let l = layout("Hxg", &s, &boxed);
+            let drawn = l.glyphs[0].y;
+            assert!((drawn - glyph_baseline).abs() < 0.15, "{family} {size} {script:?}: {drawn} vs AE {glyph_baseline}");
+        }
+    }
+}
+
+/// CodeRabbit on #1875: a face whose `d` is very short (a symbol or icon font) would put the
+/// first baseline almost at the box top; below 0.3 of the ascent the font ascent is used.
+#[test]
+fn a_short_d_falls_back_to_the_font_ascent() {
+    // Latin faces: the `d` is about 0.7 em, the ascent about 0.9 em.
+    let near = |v: Option<f32>, want: f32| v.is_some_and(|v| (v - want).abs() < 1e-3);
+    assert!(near(plausible_first(0.7, 100.0, 90.0), 70.0));
+    // A `d` a tenth of the ascent: not a lowercase ascender.
+    assert_eq!(plausible_first(0.09, 100.0, 90.0), None);
+    assert_eq!(plausible_first(0.26, 100.0, 90.0), None);
+    assert!(near(plausible_first(0.28, 100.0, 90.0), 28.0));
+    // Broken values stay rejected; an unusable ascent does not reject a sane `d`.
+    for (em, px) in [(0.0, 100.0), (-0.5, 100.0), (f32::NAN, 100.0), (5.0, 100.0), (0.7, f32::INFINITY)] {
+        assert_eq!(plausible_first(em, px, 90.0), None, "{em} {px}");
+    }
+    assert!(near(plausible_first(0.7, 100.0, f32::NAN), 70.0));
+    // The bundled faces keep the `d` rule.
+    for family in ["Inter", "Noto Serif"] {
+        let r = fonts::resolve(family, "Regular");
+        assert!(first_ascent(r.face, 100.0).is_some(), "{family}");
+    }
+}
+
+/// After Effects 2026 (EXPORTER t6): with Justify All and the every-line composer, a box that
+/// the other justifications break into lines of 6, 6 and 1 words breaks 4 / 4 / 4, so the
+/// stretched last line is not a lone word; word positions then match AE to 1 px.
+#[test]
+fn justify_all_balances_the_lines_with_the_every_line_composer() {
+    let text = "one two three four five six seven eight nine ten eleven twelve";
+    let s = st(30.0);
+    let words = |l: &Layout| -> Vec<usize> { l.lines.iter().map(|ln| text[ln.range.clone()].split_whitespace().count()).collect() };
+    let p = |last: Align| ParagraphStyle { width: Some(450.0), align: Align::Justify, justify_last: last, every_line: true, ..Default::default() };
+    let left = layout_rich_uncached(text, &[(0..text.len(), s.clone())], &[p(Align::Left)]);
+    let all = layout_rich_uncached(text, &[(0..text.len(), s)], &[p(Align::Justify)]);
+    let (wl, wa) = (words(&left), words(&all));
+    assert!(wl.last().copied().unwrap_or(0) < *wl.first().unwrap_or(&0), "{wl:?}");
+    let (lo, hi) = (wa.iter().min().copied().unwrap_or(0), wa.iter().max().copied().unwrap_or(0));
+    assert!(hi - lo <= 1, "Justify All balances the lines: {wa:?} (left-justified: {wl:?})");
+}
+
+/// After Effects 2026 (EXPORTER read-back t7): right-to-left point text with any justified
+/// code (justify last left / centre / right, justify all) sits flush right at its anchor, as
+/// right-aligned text does.
+#[test]
+fn rtl_point_text_with_a_justified_paragraph_is_flush_at_its_start() {
+    let text = "Right to left";
+    let s = st(30.0);
+    let at = |align: Align, last: Align| {
+        let p = ParagraphStyle { align, justify_last: last, rtl: Some(true), ..Default::default() };
+        let l = layout_rich_uncached(text, &[(0..text.len(), s.clone())], &[p]);
+        (l.lines[0].x, l.lines[0].x + l.lines[0].width)
+    };
+    let right = at(Align::Right, Align::Left);
+    for last in [Align::Left, Align::Center, Align::Right, Align::Justify] {
+        let got = at(Align::Justify, last);
+        assert!((got.0 - right.0).abs() < 1e-3 && (got.1 - right.1).abs() < 1e-3, "{last:?}: {got:?} vs right-aligned {right:?}");
+    }
+}
+
+/// The same holds when the direction is unset and the text itself resolves right to left.
+#[test]
+fn detected_rtl_point_text_with_a_justified_paragraph_is_flush_at_its_start() {
+    let text = "\u{5d0}\u{5d1}\u{5d2} \u{5d3}\u{5d4}";
+    let s = st(30.0);
+    let at = |align: Align| {
+        let p = ParagraphStyle { align, justify_last: Align::Left, rtl: None, ..Default::default() };
+        let l = layout_rich_uncached(text, &[(0..text.len(), s.clone())], &[p]);
+        (l.lines[0].x, l.lines[0].x + l.lines[0].width)
+    };
+    let (right, got) = (at(Align::Right), at(Align::Justify));
+    assert!((got.0 - right.0).abs() < 1e-3 && (got.1 - right.1).abs() < 1e-3, "{got:?} vs right-aligned {right:?}");
+}
+
+/// Indents follow the resolved direction too: detected right-to-left text puts its start
+/// indent on the right, as an explicit right-to-left paragraph does.
+#[test]
+fn detected_rtl_text_takes_its_indents_on_the_rtl_sides() {
+    let text = "\u{5d0}\u{5d1}\u{5d2} \u{5d3}\u{5d4}";
+    let s = st(30.0);
+    let at = |rtl: Option<bool>| {
+        let p = ParagraphStyle { align: Align::Justify, justify_last: Align::Left, indent_start: 20.0, rtl, ..Default::default() };
+        let l = layout_rich_uncached(text, &[(0..text.len(), s.clone())], &[p]);
+        (l.lines[0].x, l.lines[0].x + l.lines[0].width)
+    };
+    let (explicit, detected) = (at(Some(true)), at(None));
+    assert!((detected.0 - explicit.0).abs() < 1e-3 && (detected.1 - explicit.1).abs() < 1e-3, "{detected:?} vs {explicit:?}");
+}
+
+/// Only the first line's own runs decide whether box text starts at the font ascent: a
+/// vertical run further down leaves a horizontal first line on its `d`-height baseline.
+#[test]
+fn a_later_vertical_run_keeps_the_first_line_baseline() {
+    let text = "Top\nside";
+    let horiz = st(40.0);
+    let vert = TextStyle { vertical: true, ..horiz.clone() };
+    let p = ParagraphStyle { width: Some(400.0), ..Default::default() };
+    let plain = layout_rich_uncached(text, &[(0..text.len(), horiz.clone())], std::slice::from_ref(&p));
+    let mixed = layout_rich_uncached(text, &[(0..4, horiz), (4..text.len(), vert)], &[p]);
+    assert!((mixed.lines[0].baseline - plain.lines[0].baseline).abs() < 1e-3, "{} vs {}", mixed.lines[0].baseline, plain.lines[0].baseline);
+}
+
+/// `Item::glyphs_in` finds a cluster range by bisection when the clusters are ordered, and agrees
+/// with a full scan for ascending, descending and unordered clusters.
+#[test]
+fn item_glyphs_in_matches_a_full_scan() {
+    let glyph = |cluster| ShapedGlyph { face: 0, id: cluster as u32, cluster, adv: 1.0, pre: 0.0, dx: 0.0, dy: 0.0, size: 10.0, run: 0, rise: 0.0 };
+    let asc: Vec<usize> = vec![0, 0, 1, 3, 3, 3, 5, 8];
+    let desc: Vec<usize> = asc.iter().rev().copied().collect();
+    let mixed: Vec<usize> = vec![3, 0, 5, 1, 8, 3, 0, 3];
+    for (clusters, order) in [(&asc, Some(true)), (&desc, Some(false)), (&mixed, None)] {
+        let item = Item::new(0..9, false, clusters.iter().map(|&c| glyph(c)).collect());
+        assert_eq!(item.cluster_order, order);
+        for (a, b) in [(0, 9), (0, 1), (1, 4), (3, 4), (4, 9), (6, 8), (9, 9), (2, 3)] {
+            let got: Vec<usize> = item.glyphs_in(&(a..b)).map(|g| g.cluster).collect();
+            let want: Vec<usize> = clusters.iter().copied().filter(|c| (a..b).contains(c)).collect();
+            assert_eq!(got, want, "{clusters:?} {a}..{b}");
+        }
+    }
+}
+
+#[test]
+fn run_lookup_by_bisection_matches_the_scan() {
+    let scan = |runs: &[(Range<usize>, TextStyle)], b: usize| {
+        runs.iter().position(|(r, _)| b >= r.start && b < r.end).unwrap_or_else(|| runs.iter().rposition(|(r, _)| r.start <= b).unwrap_or(0))
+    };
+    let runs: Vec<(Range<usize>, TextStyle)> = (0..50).map(|i| (i * 3..i * 3 + 3, st(10.0))).collect();
+    let gapped: Vec<(Range<usize>, TextStyle)> = (0..50).map(|i| (i * 4..i * 4 + 3, st(10.0))).collect();
+    // Overlapping runs: the first run holding a byte wins, as in the scan.
+    let overlapping: Vec<(Range<usize>, TextStyle)> = vec![(0..10, st(10.0)), (5..15, st(20.0)), (12..20, st(30.0))];
+    assert!(runs_ordered(&runs) && runs_ordered(&gapped) && !runs_ordered(&overlapping));
+    for b in 0..220 {
+        assert_eq!(run_at(&runs, true, b), scan(&runs, b), "{b}");
+        assert_eq!(run_at(&gapped, true, b), scan(&gapped, b), "{b}");
+        assert_eq!(run_at(&overlapping, false, b), scan(&overlapping, b), "{b}");
+    }
+    assert_eq!(run_at(&overlapping, false, 6), 0);
+    // A reversed range (20..0) among others is not ordered either, and takes the scan.
+    #[allow(clippy::reversed_empty_ranges)]
+    let reversed: Vec<(Range<usize>, TextStyle)> = vec![(0..10, st(10.0)), (20..0, st(20.0)), (5..15, st(30.0)), (15..20, st(40.0))];
+    assert!(!runs_ordered(&reversed));
+    for b in 0..30 {
+        assert_eq!(run_at(&reversed, runs_ordered(&reversed), b), scan(&reversed, b), "{b}");
+    }
+    assert_eq!(run_at(&[], true, 5), 0);
 }

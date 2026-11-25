@@ -29,6 +29,17 @@ fn levels_and_gamma() {
     );
     effect_case("ec.color.levelsic", &[("green/greenInBlack", n(0.2)), ("green/greenInWhite", n(0.6)), ("clipToOutputWhite", e(0))]);
     effect_case("ec.color.levelsic", &[("alpha/alphaOutBlack", n(0.3))]);
+    // #3487-#3491: the ends of the valid ranges, the curve bounded where gamma 0 would overflow.
+    effect_case(
+        "ec.color.levelsic",
+        &[
+            ("rgb/rgbInWhite", n(0.2)),
+            ("rgb/rgbGamma", n(0.0)),
+            ("red/redOutBlack", n(-10000.0)),
+            ("blue/blueOutWhite", n(10000.0)),
+            ("clipToOutputWhite", e(0)),
+        ],
+    );
     effect_case("ec.color.levels", &[("redInBlack", n(0.1)), ("greenGamma", n(1.5)), ("blueOutWhite", n(0.7)), ("inWhite", n(0.9))]);
     effect_case("ec.color.levels", &[("alphaInWhite", n(0.6)), ("redInWhite", n(0.5)), ("redClipToOutputWhite", e(0))]);
     effect_case("ec.color.gammapedestalgain", &[("redGamma", n(1.4)), ("greenPedestal", n(0.1)), ("blueGain", n(0.8))]);
@@ -70,6 +81,8 @@ fn colour_replacement() {
         &[("amount", n(100.0)), ("color", c(0.8, 0.4, 0.3)), ("matchColors", e(1)), ("tolerance", n(5.0)), ("edgeSoftness", n(30.0))],
     );
     effect_case("ec.color.changecolor", &[("hueTransform", n(90.0)), ("colorToChange", c(0.7, 0.5, 0.4)), ("matchingSoftness", n(20.0))]);
+    // #3480: near the top of After Effects' range (four and three quarter turns).
+    effect_case("ec.color.changecolor", &[("hueTransform", n(1710.0)), ("colorToChange", c(0.7, 0.5, 0.4)), ("matchingSoftness", n(20.0))]);
     effect_case(
         "ec.color.changecolor",
         &[
@@ -164,7 +177,7 @@ fn color_stabilizer() {
             pos.keys = vec![Keyframe::new(Tick::ZERO, crate::tests::v3(22.0, 18.0)), Keyframe::new(Tick::from_seconds_f64(1.0), crate::tests::v3(38.0, 24.0))];
             let op = a.props.prop_mut("transform/opacity").unwrap();
             op.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(100.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(40.0))];
-            s.p.comp_mut(inner_id).unwrap().layers = vec![a];
+            s.p.comp_mut(inner_id).unwrap().layers = vec![a].into();
             let mut l = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (60, 40), None);
             let vals = [
                 ("stabilize", e(mode)),
@@ -187,4 +200,34 @@ fn color_stabilizer() {
 #[test]
 fn gradient_ramp_matches_the_cpu() {
     effect_case("ec.generate.gradientramp", &[]);
+}
+
+/// #3487-#3491: at the ends of the valid ranges the GPU's Levels (Individual Controls) output is
+/// finite (the CPU / GPU comparison counts infinity on both sides as equal).
+#[test]
+fn levels_ic_is_finite_at_the_ends_of_its_ranges() {
+    let Some(g) = crate::tests::gpu() else { return };
+    let spec = effectcraft_effects::find("ec.color.levelsic").unwrap();
+    let size = [16.0, 8.0];
+    let mut params =
+        effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };
+    for (k, v) in [
+        ("rgb/rgbInWhite", n(0.2)),
+        ("rgb/rgbGamma", n(0.0)),
+        ("red/redOutBlack", n(-10000.0)),
+        ("blue/blueOutWhite", n(10000.0)),
+        ("green/greenOutWhite", n(0.0)),
+        ("clipToOutputWhite", e(0)),
+    ] {
+        params.values.insert(k.to_string(), v);
+    }
+    let mut img = crate::tests::pattern(7, 16, 8);
+    for p in &mut img.data {
+        *p = p.map(|v| v * 3.0);
+    }
+    let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale: 1.0 };
+    let ctx = effectcraft_effects::EffectCtx { params: &params, time: 0.0, layer_size: size, seed: 1, adjustment: false, env: Default::default() };
+    let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx }], &buf, None)
+        .expect("the GPU runs Levels (Individual Controls)");
+    assert!(out.img.data.iter().flatten().all(|v| v.is_finite()), "{:?}", out.img.data.iter().find(|p| p.iter().any(|v| !v.is_finite())));
 }

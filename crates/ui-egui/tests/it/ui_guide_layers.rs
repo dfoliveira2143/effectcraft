@@ -1,6 +1,7 @@
 //! Guide Layer in the layer context menus (Timeline rows and the Composition viewer), a plain item
 //! (no check mark) that toggles the switch on the selection, and the guide mark by a guide layer's
 //! name.
+use crate::gpu_test::RenderSerial;
 use effectcraft_engine::Session;
 use effectcraft_engine::project::LayerId;
 use effectcraft_ui_egui::EffectcraftApp;
@@ -20,7 +21,10 @@ fn harness() -> (Harness<'static, EffectcraftApp>, LayerId, LayerId) {
     };
     let left = solid("Left", 160.0);
     let right = solid("Right", 480.0);
-    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(session));
+    let mut h = Harness::builder()
+        .with_size(vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(session));
     h.run_steps(3);
     (h, left, right)
 }
@@ -45,7 +49,7 @@ fn guide(h: &Harness<'_, EffectcraftApp>, id: LayerId) -> bool {
 
 fn snapshot(h: &mut Harness<'_, EffectcraftApp>, name: &str) {
     if let Ok(dir) = std::env::var("GUIDE_LAYER_SNAPSHOTS") {
-        h.render().unwrap().save(format!("{dir}/{name}.png")).unwrap();
+        h.render_serialized().unwrap().save(format!("{dir}/{name}.png")).unwrap();
     }
 }
 

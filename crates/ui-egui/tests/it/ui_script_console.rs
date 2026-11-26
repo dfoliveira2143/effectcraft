@@ -1,6 +1,7 @@
 //! Window ▸ Script Console: the panel shows, runs JavaScript through `script.run` (persistent
 //! context) and logs output, results and errors (egui_kittest, UI logic only).
 
+use crate::gpu_test::RenderSerial;
 use effectcraft_ui_egui::EffectcraftApp;
 use effectcraft_ui_egui::dock::PanelKind;
 use egui_kittest::Harness;
@@ -18,7 +19,10 @@ fn click(h: &mut Harness<'_, EffectcraftApp>, id: &str) {
 #[test]
 fn script_console_runs_scripts() {
     let s = effectcraft_host::session();
-    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.state_mut().show_panel(PanelKind::ScriptConsole);
     h.run_steps(3);
     for id in ["scriptConsole.input", "scriptConsole.output", "scriptConsole.run", "scriptConsole.clear"] {
@@ -49,7 +53,10 @@ fn script_console_runs_scripts() {
 #[ignore]
 fn script_console_snapshot() {
     let s = effectcraft_host::session();
-    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1400.0, 900.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.state_mut().show_panel(PanelKind::ScriptConsole);
     h.run_steps(2);
     for code in ["var c = app.project.items.addComp('Console', 320, 180, 1, 2, 24); writeLn('made ' + c.name); c.id", "c.layers.addText('Hi').name", "nope()"] {
@@ -59,7 +66,7 @@ fn script_console_snapshot() {
     }
     h.state_mut().ui.script_console.input = "app.project.numItems".into();
     h.run_steps(3);
-    let img = h.render().expect("render");
+    let img = h.render_serialized().expect("render");
     let out = std::env::var("SC_SNAPSHOT").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/test-out/script_console.png").into());
     if let Some(d) = std::path::Path::new(&out).parent() {
         std::fs::create_dir_all(d).unwrap();

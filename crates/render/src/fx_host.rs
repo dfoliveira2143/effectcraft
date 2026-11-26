@@ -1,4 +1,5 @@
-use super::*;
+use super::frames::frame_blend_mode;
+use super::{Arc, Buf, EffectHost, EvalCtx, FrameBlend, ItemKind, Layer, LayerPixels, LayerSource, Params, Renderer, Tick, three_d};
 
 /// Layer parameters and audio for effects (see [`effectcraft_effects::EffectHost`]). What it
 /// hands out is in effect space (see [`effect_bounds`]): the other layer's for its pixels, the
@@ -72,6 +73,14 @@ impl EffectHost for FxHost<'_, '_, '_> {
             return None;
         }
         let sub = self.r.nested();
+        // A 3D model or primitive layer has no 2D source of its own: an effect referencing one
+        // reads it as After Effects does — the layer rendered on its own through the comp's
+        // camera (Create 3D Layer Instance's effect), in the layer's effect space (the
+        // comp, centred on the layer's anchor).
+        if other.source.is_model() {
+            let buf = sub.solo_3d(self.ctx, other);
+            return Some(self.pixels(other, buf, false));
+        }
         // The cached layer buffer is shared; effects get their own copy.
         let buf = if masks_and_effects { (*sub.content_buf(self.ctx, other)?).clone() } else { sub.source(self.ctx, other)? };
         Some(self.pixels(other, buf, true))
@@ -87,15 +96,17 @@ impl EffectHost for FxHost<'_, '_, '_> {
         Some(self.pixels(other, buf, false))
     }
 
+    /// The audio of footage layer `id` from `start`, or `None` when the layer is not footage.
     fn audio(&self, id: u64, start: f64, frames: usize, rate: u32) -> Option<Vec<f32>> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
         let LayerSource::Footage { item } = &other.source else { return None };
-        let ItemKind::Footage(f) = &self.r.project.item(*item)?.kind else { return None };
+        let item = self.ctx.media_item(other, *item);
+        let ItemKind::Footage(f) = &self.r.project.item(item)?.kind else { return None };
         if !f.has_audio {
             return None;
         }
         let st = other.layer_time(Tick::from_seconds_f64(start));
-        self.r.footage.audio(*item, f, st, frames, rate)
+        self.r.read(|| self.r.footage.audio(item, f, st, frames, rate))
     }
 
     fn self_at(&self, layer_time: f64, effects: usize) -> Option<Buf> {
@@ -116,6 +127,25 @@ impl EffectHost for FxHost<'_, '_, '_> {
         let g = self.layer.effects()?.groups().nth(self.index)?;
         let ctx = self.ctx.at(self.layer.comp_time(Tick::from_seconds_f64(layer_time)));
         Some(effectcraft_effects::flatten_params(g, &mut |pr| ctx.value(self.layer, pr)))
+    }
+
+    fn param_at(&self, effect_index: usize, id: &str, layer_time: f64) -> Option<effectcraft_keyframe::Value> {
+        // Only the one property: a simulation samples it at every step. Its keyframes are read
+        // at the requested layer time exactly (mapping it to comp time and back rounds under a
+        // fractional stretch, so a Hold key there could read its previous value).
+        let p = effect_param(self.layer, effect_index, id)?;
+        let lt = Tick::from_seconds_f64(layer_time);
+        Some(self.ctx.at(self.layer.comp_time(lt)).value_at_layer_time(self.layer, p, lt))
+    }
+
+    fn param_is_static(&self, effect_index: usize, id: &str) -> bool {
+        let Some(p) = effect_param(self.layer, effect_index, id) else { return false };
+        let Some(o) = self.ctx.property_overrides.iter().rev().find(|o| o.layer == self.layer.id && o.prop == p.uid) else {
+            return p.keys.is_empty() && !p.has_expression();
+        };
+        // A whole-value override replaces the target property's keys. A Font override leaves them
+        // in place, so those keys still make the value vary over time.
+        o.keys.is_empty() && !p.has_expression() && (!o.font || p.keys.is_empty())
     }
 
     fn comp_scene(&self) -> Option<effectcraft_effects::CompScene> {
@@ -140,17 +170,72 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 }
 
+/// Parameter `id` (a flattened id: match ids joined by `/`) of effect `effect_index` in
+/// `layer`'s stack.
+fn effect_param<'a>(layer: &'a Layer, effect_index: usize, id: &str) -> Option<&'a effectcraft_project::Property> {
+    let mut g = layer.effects()?.groups().nth(effect_index)?;
+    let mut path = id.split('/').peekable();
+    while let Some(m) = path.next() {
+        if path.peek().is_none() {
+            return g.children.iter().find_map(|c| match c {
+                effectcraft_project::Node::Prop(p) if p.match_id == m => Some(p),
+                _ => None,
+            });
+        }
+        g = g.children.iter().find_map(|c| match c {
+            effectcraft_project::Node::Group(sg) if sg.match_id == m => Some(sg),
+            _ => None,
+        })?;
+    }
+    None
+}
+
+/// Whether an instance's keys are in the nested comp's time, so they can go into the comp as they
+/// are: not with Time Remap, Responsive Design - Time (a stretched precomp with protected
+/// regions), a nested comp that preserves its frame rate (its time is floored to its own frames)
+/// or a layer with Frame Blending (it renders the nested comp at two other times and mixes them,
+/// so keys would pull the next frame's value in early).
+fn keys_in_nested_time(ctx: &EvalCtx, layer: &Layer) -> bool {
+    if layer.props.get("timeRemap").is_some() || frame_blend_mode(ctx, layer) != FrameBlend::Off {
+        return false;
+    }
+    let LayerSource::Comp { item } = layer.source else { return true };
+    let Some(nc) = ctx.project.comp(item) else { return true };
+    let responsive = (layer.stretch - 100.0).abs() > 1e-9 && !super::eval::protected_regions(nc).is_empty();
+    !responsive && !nc.preserve_frame_rate
+}
+
 /// The Essential Properties overrides of a precomp layer, evaluated at the context time.
 pub fn essential_overrides(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_project::essential::Override> {
     use effectcraft_project::essential;
     let over = essential::overridden(layer);
     let Some(g) = essential::group(layer).filter(|_| !over.is_empty()) else { return vec![] };
+    let same_time = keys_in_nested_time(ctx, layer);
     let mut out = vec![];
     g.walk("", &mut |_, p| {
         if over.contains(&p.uid)
             && let Some(control) = essential::control_of(&p.match_id)
         {
-            out.push(essential::Override { control, value: ctx.value(layer, p) });
+            // An expression on the instance property replaces its keys. A whole-value override
+            // from a collapsed parent replaces the instance's own keys with the parent's; a Font
+            // override leaves them in place, so the font merges into their history.
+            let parent = ctx.property_overrides.iter().rev().find(|o| o.layer == layer.id && o.prop == p.uid);
+            let keys = if !same_time || p.has_expression() {
+                vec![]
+            } else if let Some(parent) = parent {
+                if parent.font {
+                    let mut keys = p.keys.clone();
+                    for key in &mut keys {
+                        effectcraft_project::essential::merge_font(&mut key.value, &parent.value);
+                    }
+                    keys
+                } else {
+                    parent.keys.clone()
+                }
+            } else {
+                p.keys.clone()
+            };
+            out.push(essential::Override { control, value: ctx.value(layer, p), keys });
         }
     });
     out

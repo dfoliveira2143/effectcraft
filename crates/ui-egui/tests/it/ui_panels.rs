@@ -2,6 +2,7 @@
 //! registers its automation ids; the Footage panel's buttons edit into the comp; the Progress
 //! panel lists and cancels a job; Lumetri Scopes switch scope through their dropdown.
 
+use crate::gpu_test::RenderSerial;
 use effectcraft_ui_egui::dock::WorkspaceExt as _;
 use std::sync::Arc;
 
@@ -17,7 +18,10 @@ fn harness() -> Harness<'static, EffectcraftApp> {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Panels", "width": 320, "height": 180, "duration": 4})).unwrap();
     s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.run_steps(3);
     h
 }
@@ -147,8 +151,13 @@ fn click_at(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
 fn double_click_at(h: &mut Harness<'_, EffectcraftApp>, pos: Pos2) {
     h.input_mut().events.push(Event::PointerMoved(pos));
     h.step();
+    // One press per step, as the runtime takes them: the releases are one step (0.25 s) apart,
+    // within egui's double-click interval (0.3 s).
     for pressed in [true, false, true, false] {
         h.input_mut().events.push(Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        if pressed {
+            h.step();
+        }
     }
     h.run_steps(3);
 }
@@ -168,7 +177,10 @@ fn saved_workspaces_persist_across_sessions() {
     let store = std::sync::Arc::new(MemoryConfig::default());
     let launch = || {
         let s = Session { config: Some(store.clone()), ..Default::default() };
-        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+            .build_eframe(|_| EffectcraftApp::new(s));
         h.run_steps(2);
         h
     };
@@ -337,7 +349,10 @@ fn ui_scale_setting_sizes_the_interface() {
     assert_eq!(ctx.zoom_factor(), 0.9);
     // A saved scale applies from the first frame.
     let s = Session { prefs: effectcraft_engine::prefs::Prefs::from_json(&h.state().session.prefs.to_json()), ..Default::default() };
-    let mut h2 = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h2 = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h2.run_steps(3);
     assert_eq!(h2.ctx.zoom_factor(), 0.9);
 }
@@ -358,7 +373,10 @@ fn settings_buttons_stay_in_view_at_200_percent() {
     s.prefs.disk.disk_cache_enabled = false;
     s.prefs.set("appearance.uiScale", json!(200)).unwrap();
     s.save_prefs();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.run_steps(3);
     assert_eq!(scale(&h), (200, 2.0));
     let rect = |h: &Harness<'_, EffectcraftApp>, id: &str| {
@@ -422,7 +440,10 @@ fn panels_snapshot() {
     s.execute("file.openDemoProject", json!({})).unwrap();
     let solid = s.project.items.values().find(|i| matches!(i.kind, effectcraft_engine::project::ItemKind::Solid(_))).map(|i| i.id.0);
     let mut app = Some(EffectcraftApp::new(s));
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app.take().expect("app"));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| app.take().expect("app"));
     h.run_steps(3);
     let ctx = h.ctx.clone();
     effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "window.workspace", json!({"name": "All Panels"})).unwrap();
@@ -448,7 +469,7 @@ fn panels_snapshot() {
         }
         open(&mut h, panel);
         h.run_steps(3);
-        let img = h.render().expect("render");
+        let img = h.render_serialized().expect("render");
         img.save(format!("{dir}/{panel}{scope}.png")).unwrap();
     }
 }
@@ -663,4 +684,34 @@ fn transition_presets_apply_from_effects_and_presets() {
     let fx = comp.layers[0].effects().unwrap().groups().next().expect("an effect was added").clone();
     assert_eq!(fx.name, "Radial Wipe");
     assert_eq!(fx.prop("completion").unwrap().keys.len(), 2);
+}
+
+/// #2582: dragging Settings' UI Scale doesn't resize the interface under the pointer; the value
+/// applies once the button is released.
+#[test]
+fn ui_scale_applies_when_the_drag_ends() {
+    let mut h = harness();
+    open_settings(&mut h);
+    let e = h.state().auto.find("settings.appearance.uiScale").expect("the UI Scale field");
+    let from = pos2(e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0);
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    for k in 1..=8 {
+        h.input_mut().events.push(Event::PointerMoved(from + egui::vec2(10.0 * k as f32, 0.0)));
+        h.step();
+        assert_eq!(scale(&h), (100, 1.0), "nothing applies mid-drag");
+    }
+    h.input_mut().events.push(Event::PointerButton {
+        pos: from + egui::vec2(80.0, 0.0),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Default::default(),
+    });
+    h.run_steps(4);
+    let (pct, zoom) = scale(&h);
+    assert!(pct > 100 && (zoom - pct as f32 / 100.0).abs() < 1e-6, "applied on release: {pct} {zoom}");
+    click(&mut h, "settings.cancel");
+    h.run_steps(2);
+    assert_eq!(scale(&h), (100, 1.0));
 }

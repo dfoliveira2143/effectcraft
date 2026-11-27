@@ -10,7 +10,10 @@ use serde_json::{Value, json};
 fn harness() -> Harness<'static, EffectcraftApp> {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Lights", "width": 640, "height": 360, "duration": 2})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.step();
     h
 }
@@ -177,11 +180,31 @@ fn falloff_and_shadow_options_show_only_for_lights_that_have_them() {
     invoke(&mut h, "layer.newLight", json!({}));
     for k in LightKind::ALL {
         choose(&mut h, k);
-        let shown = !matches!(k, LightKind::Ambient | LightKind::Environment);
-        for label in ["Falloff", "Casts Shadows", "Shadow Darkness"] {
-            assert_eq!(h.query_by_label(label).is_some(), shown, "{label} for {}", k.label());
+        // Falloff is distance attenuation: image-based Environment lights and Ambient have none.
+        let falloff = !matches!(k, LightKind::Ambient | LightKind::Environment);
+        assert_eq!(h.query_by_label("Falloff").is_some(), falloff, "Falloff for {}", k.label());
+        // Cast Shadows shows for every light but Ambient, Environment included (#2436).
+        let shadows = k != LightKind::Ambient;
+        for label in ["Casts Shadows", "Shadow Darkness"] {
+            assert_eq!(h.query_by_label(label).is_some(), shadows, "{label} for {}", k.label());
         }
     }
+}
+
+/// #2436: an Environment light created through the dialog keeps its Cast Shadows, which the
+/// engine stores on the layer.
+#[test]
+fn an_environment_light_takes_cast_shadows_from_the_dialog() {
+    let mut h = harness();
+    invoke(&mut h, "layer.newLight", json!({}));
+    choose(&mut h, LightKind::Environment);
+    click_id(&mut h, "dialog.light.casts");
+    ok(&mut h);
+    let id = last_layer(&h);
+    assert_eq!(kind(&h, id), LightKind::Environment);
+    let l = layer(&h, id);
+    assert!(l.props.prop("lightOptions/castsShadows").unwrap().value.as_bool(), "the dialog's checkbox reached the layer");
+    assert!(l.props.prop("lightOptions/shadowDarkness").is_some() && l.props.prop("lightOptions/falloff").is_none());
 }
 
 #[test]

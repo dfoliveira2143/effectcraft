@@ -1,6 +1,10 @@
-use super::limits::{Budget, DECODE_BUDGET, Error, Result, decode_pixels, finite_sample, inflate, release_bytes, too_large};
-use super::model::{ColorMode, Pixels, Rect};
-use super::*;
+#[cfg(test)]
+use super::counters;
+use super::limits::{Budget, DECODE_BUDGET, Error, Result, decode_pixels, finite_sample, release_bytes, too_large};
+use super::model::{ColorMode, Layer, Pixels, Rect};
+use super::{Psd, Reader};
+use craft_psd::compression::PlaneStream;
+use std::borrow::Cow;
 
 impl Psd {
     fn bytes_per_sample(&self) -> usize {
@@ -29,13 +33,15 @@ impl Psd {
     pub(crate) fn plane_bytes<'a>(&self, comp: u16, r: &mut Reader<'a>, w: usize, h: usize, budget: &mut Budget) -> Result<Cow<'a, [u8]>> {
         let rowb = self.row_bytes(w);
         let size = rowb.checked_mul(h).ok_or_else(|| too_large(w, h))?;
-        Ok(match self.open_planes(comp, r, 1, 1, w, h, budget)? {
-            PlaneStream::Raw => Cow::Borrowed(r.bytes(size)?),
-            PlaneStream::Rle(counts) => Cow::Owned(Self::unpack_plane(&counts, 0, r, rowb, h, budget)?),
-            PlaneStream::Zip(mut v) => {
-                v.resize(size, 0);
-                self.zip_plane(comp, &mut v, 0, w, h)?;
-                Cow::Owned(v)
+        let mut stream = self.open_planes(comp, r, 1, 1, (w, h), budget)?;
+        Ok(match &mut stream {
+            PlaneStream::Raw { .. } => Cow::Borrowed(stream.next_raw_plane(size).map_err(compression_err)?),
+            PlaneStream::Rle { .. } => Cow::Owned(Self::unpack_plane(&mut stream, 0, rowb, h, budget)?),
+            PlaneStream::Zip { data } => {
+                // Single-channel recovery: zero-pad short ZIP streams before un-predicting.
+                data.resize(size, 0);
+                self.zip_plane(comp, data, 0, w, h, budget)?;
+                Cow::Owned(std::mem::take(data))
             }
         })
     }
@@ -44,71 +50,62 @@ impl Psd {
     /// `w`×`h` samples, of which the first `want` are decoded: the RLE row sizes of every plane,
     /// or the inflated ZIP data, which holds all planes one after another (charged to `budget`
     /// before it is inflated).
-    #[allow(clippy::too_many_arguments)]
-    fn open_planes(&self, comp: u16, r: &mut Reader, total: usize, want: usize, w: usize, h: usize, budget: &mut Budget) -> Result<PlaneStream> {
-        let size = self.row_bytes(w).checked_mul(h).ok_or_else(|| too_large(w, h))?;
-        Ok(match comp {
-            0 => PlaneStream::Raw,
-            1 => {
-                let n = total.saturating_mul(h);
-                let mut counts = Vec::with_capacity(n.min(r.remaining() / 2));
-                for _ in 0..n {
-                    counts.push(if self.psb { r.u32()? as usize } else { r.u16()? as usize });
-                }
-                PlaneStream::Rle(counts)
-            }
-            2 | 3 => {
-                let rest = r.bytes(r.remaining())?;
-                // One stream holds every plane: what it may decode to is what they need.
-                let all = size.checked_mul(want).ok_or_else(|| too_large(w, h))?;
-                budget.charge(all as u64)?;
-                PlaneStream::Zip(inflate(rest, all)?)
-            }
-            c => return Err(Error::Unsupported(format!("compression {c}"))),
-        })
+    fn open_planes<'a>(&self, comp: u16, r: &mut Reader<'a>, total: usize, want: usize, size: (usize, usize), budget: &mut Budget) -> Result<PlaneStream<'a>> {
+        let (w, h) = size;
+        let plane_size = self.row_bytes(w).checked_mul(h).ok_or_else(|| too_large(w, h))?;
+        let zip_limit = if matches!(comp, 2 | 3) { plane_size.checked_mul(want).ok_or_else(|| too_large(w, h))? } else { 0 };
+        let rest = r.bytes(r.remaining())?;
+        PlaneStream::open(
+            craft_psd::Compression::from_u16(comp),
+            rest,
+            total,
+            h,
+            if self.psb { craft_psd::Version::Psb } else { craft_psd::Version::Psd },
+            zip_limit,
+            |bytes| budget.charge(bytes as u64).map_err(|e| craft_psd::PsdError::Unsupported(e.to_string())),
+        )
+        .map_err(compression_err)
     }
 
     /// The raw bytes (`row_bytes(w)` × `h`, ZIP prediction undone) of plane `c`: raw and RLE
-    /// planes are read from `r` in order, raw ones borrowed from the file data, ZIP ones from the
-    /// inflated buffer (un-predicted in place; already charged by `open_planes`), RLE ones charged
-    /// to `budget`.
-    #[allow(clippy::too_many_arguments)]
+    /// planes are read from `stream` in order, raw ones borrowed from the file data, ZIP ones from
+    /// the inflated buffer (un-predicted in place; already charged by `open_planes`), RLE ones
+    /// charged to `budget`.
     fn decode_plane<'x, 'a: 'x>(
         &self,
         comp: u16,
-        planes: &'x mut PlaneStream,
-        r: &mut Reader<'a>,
+        planes: &'x mut PlaneStream<'a>,
         c: usize,
-        w: usize,
-        h: usize,
+        size: (usize, usize),
         budget: &mut Budget,
     ) -> Result<Cow<'x, [u8]>> {
+        let (w, h) = size;
         let rowb = self.row_bytes(w);
         let size = rowb.checked_mul(h).ok_or_else(|| too_large(w, h))?;
         Ok(match planes {
-            PlaneStream::Raw => Cow::Borrowed(r.bytes(size)?),
-            PlaneStream::Rle(counts) => Cow::Owned(Self::unpack_plane(counts, c, r, rowb, h, budget)?),
-            PlaneStream::Zip(v) => Cow::Borrowed(self.zip_plane(comp, v, c, w, h)?),
+            PlaneStream::Raw { .. } => Cow::Borrowed(planes.next_raw_plane(size).map_err(compression_err)?),
+            PlaneStream::Rle { .. } => Cow::Owned(Self::unpack_plane(planes, c, rowb, h, budget)?),
+            PlaneStream::Zip { data } => Cow::Borrowed(self.zip_plane(comp, data, c, w, h, budget)?),
         })
     }
 
-    /// Unpack the `h` RLE rows of plane `c` (row byte counts `counts`, plane after plane) into a
-    /// buffer charged to `budget`.
-    fn unpack_plane(counts: &[usize], c: usize, r: &mut Reader, rowb: usize, h: usize, budget: &mut Budget) -> Result<Vec<u8>> {
+    /// Unpack the `h` RLE rows of plane `c` into a buffer charged to `budget`, using padded
+    /// PackBits recovery.
+    fn unpack_plane(planes: &mut PlaneStream<'_>, c: usize, rowb: usize, h: usize, budget: &mut Budget) -> Result<Vec<u8>> {
         let mut out = budget.vec::<u8>(rowb.checked_mul(h).ok_or(Error::Truncated)?)?;
-        for row in 0..h {
-            let n = *counts.get(c * h + row).ok_or(Error::Truncated)?;
-            unpack_bits(r.bytes(n)?, rowb, &mut out)?;
-        }
+        planes.next_rle_plane_into(c, rowb, h, true, &mut out).map_err(|e| match e {
+            craft_psd::PsdError::UnexpectedEof { .. } | craft_psd::PsdError::Decompress(_) => Error::Truncated,
+            other => Error::Invalid(other.to_string()),
+        })?;
         Ok(out)
     }
 
     /// Plane `c` of the inflated ZIP data of consecutive planes, un-predicted in place (`comp` 3).
-    pub(crate) fn zip_plane<'v>(&self, comp: u16, v: &'v mut [u8], c: usize, w: usize, h: usize) -> Result<&'v [u8]> {
+    pub(crate) fn zip_plane<'v>(&self, comp: u16, v: &'v mut [u8], c: usize, w: usize, h: usize, budget: &mut Budget) -> Result<&'v [u8]> {
         let rowb = self.row_bytes(w);
         let plane = v.get_mut(c * rowb * h..(c + 1) * rowb * h).ok_or(Error::Truncated)?;
         if comp == 3 {
-            self.unpredict(plane, w, h);
+            self.unpredict(plane, w, h, budget)?;
         }
         Ok(plane)
     }
@@ -130,44 +127,38 @@ impl Psd {
         if self.depth == 1 { w.div_ceil(8) } else { w * self.bytes_per_sample() }
     }
 
-    pub(crate) fn unpredict(&self, v: &mut [u8], w: usize, h: usize) {
-        match self.depth {
-            16 => {
-                for row in v.chunks_exact_mut(w * 2).take(h) {
-                    let mut prev = 0u16;
-                    for c in row.as_chunks_mut::<2>().0 {
-                        let x = u16::from_be_bytes([c[0], c[1]]).wrapping_add(prev);
-                        c.copy_from_slice(&x.to_be_bytes());
-                        prev = x;
-                    }
-                }
-            }
-            32 => {
-                // One scratch row for the whole plane.
-                let mut planar = vec![0u8; w * 4];
-                #[cfg(test)]
-                counters::bump(&counters::SCRATCH);
-                for row in v.chunks_exact_mut(w * 4).take(h) {
-                    for i in 1..row.len() {
-                        row[i] = row[i].wrapping_add(row[i - 1]);
-                    }
-                    // Bytes are stored plane by plane (all first bytes, then all second bytes…).
-                    planar.copy_from_slice(row);
-                    for x in 0..w {
-                        for b in 0..4 {
-                            row[x * 4 + b] = planar[b * w + x];
-                        }
-                    }
-                }
-            }
-            _ => {
-                for row in v.chunks_exact_mut(w).take(h) {
-                    for i in 1..row.len() {
-                        row[i] = row[i].wrapping_add(row[i - 1]);
-                    }
-                }
-            }
+    /// Undo ZIP prediction in place; the 32-bit scratch row is charged to `budget`.
+    pub(crate) fn unpredict(&self, v: &mut [u8], w: usize, h: usize, budget: &mut Budget) -> Result<()> {
+        // Preserve the reader's recovery behavior: decode only complete rows, at most h.
+        // The fallback depths historically used byte-wise prediction rather than packed bits.
+        let depth = match self.depth {
+            16 => 16,
+            32 => 32,
+            _ => 8,
+        };
+        let rowb = w.checked_mul(usize::from(depth / 8)).ok_or_else(|| too_large(w, h))?;
+        if rowb == 0 {
+            return Ok(());
         }
+        let rows = (v.len() / rowb).min(h);
+        let layout = craft_psd::compression::PlaneLayout {
+            planes: 1,
+            width: w,
+            height: rows,
+            depth,
+            version: if self.psb { craft_psd::Version::Psb } else { craft_psd::Version::Psd },
+        };
+        let mut scratch = if depth == 32 {
+            let scratch = budget.filled(rowb, 0u8)?;
+            #[cfg(test)]
+            counters::bump(&counters::SCRATCH);
+            scratch
+        } else {
+            Vec::new()
+        };
+        let result = craft_psd::compression::unpredict_with_scratch(&mut v[..rows * rowb], &layout, &mut scratch);
+        budget.release(scratch.len() as u64);
+        result.map_err(|e| Error::Invalid(e.to_string()))
     }
 
     /// Hand every sample of `raw` (`w`×`h`, row-major, in order) to `f` as a float. Samples a short
@@ -265,9 +256,9 @@ impl Psd {
         // Opaque black until a channel says otherwise.
         let mut data = budget.filled(n, [0.0f32, 0.0, 0.0, 1.0])?;
         let mut black = if self.mode == ColorMode::Cmyk && want > 3 { Some(budget.filled(n, 0.0f32)?) } else { None };
-        let mut stream = self.open_planes(comp, &mut r, nch, want, w, h, &mut budget)?;
+        let mut stream = self.open_planes(comp, &mut r, nch, want, (w, h), &mut budget)?;
         for c in 0..want {
-            let raw = self.decode_plane(comp, &mut stream, &mut r, c, w, h, &mut budget)?;
+            let raw = self.decode_plane(comp, &mut stream, c, (w, h), &mut budget)?;
             self.store_merged_channel(c, &raw, &mut data, &mut black);
             release_bytes(&mut budget, raw);
         }
@@ -407,12 +398,19 @@ impl Psd {
                 }
             }
         }
+        self.apply_layer_mask(l, out_rect, &mut out, &mut budget)?;
+        Ok(Pixels { width: ow as u32, height: oh as u32, data: out })
+    }
+
+    /// Apply the raster mask to alpha, including its default outside the mask bounds.
+    fn apply_layer_mask(&self, l: &Layer, out_rect: Rect, out: &mut [[f32; 4]], budget: &mut Budget) -> Result<()> {
+        let (ow, oh) = (out_rect.width() as usize, out_rect.height() as usize);
         // Layer mask: multiplies alpha (also outside the mask rect, by its default colour).
         if let Some(m) = l.mask.filter(|m| !m.disabled) {
             let mc = l.channels.iter().find(|c| c.id == -2);
             let (mw, mh) = (m.rect.width() as usize, m.rect.height() as usize);
             let mask = match mc {
-                Some(c) if mw > 0 && mh > 0 => Some(self.channel_floats(c.offset, c.len, mw, mh, &mut budget)?),
+                Some(c) if mw > 0 && mh > 0 => Some(self.channel_floats(c.offset, c.len, mw, mh, budget)?),
                 _ => None,
             };
             let def = m.default_color as f32 / 255.0;
@@ -426,7 +424,7 @@ impl Psd {
                 }
             };
             match &mask {
-                None => scale(&mut out, outside),
+                None => scale(out, outside),
                 Some(mk) => {
                     // The columns of the output that fall inside the mask rect (the same for every row).
                     let lo = (i64::from(m.rect.left) - i64::from(out_rect.left)).clamp(0, ow as i64);
@@ -454,76 +452,27 @@ impl Psd {
                 }
             }
         }
-        Ok(Pixels { width: ow as u32, height: oh as u32, data: out })
+        Ok(())
     }
 }
 
-/// The pixel data of a run of planes, as prepared by `Psd::open_planes`.
-enum PlaneStream {
-    Raw,
-    /// RLE row byte counts of every plane, plane after plane.
-    Rle(Vec<usize>),
-    /// The inflated ZIP data of all planes.
-    Zip(Vec<u8>),
+fn compression_err(e: craft_psd::PsdError) -> Error {
+    match e {
+        craft_psd::PsdError::UnexpectedEof { .. } => Error::Truncated,
+        craft_psd::PsdError::Unsupported(s) => Error::Unsupported(s),
+        other => Error::Invalid(other.to_string()),
+    }
 }
 
 /// PackBits decoding of one row (appends exactly `row` bytes, zero-padded).
+#[cfg(test)]
 pub(crate) fn unpack_bits(src: &[u8], row: usize, out: &mut Vec<u8>) -> Result<()> {
-    let start = out.len();
-    let mut i = 0;
-    while i < src.len() && out.len() - start < row {
-        let n = src[i] as i8;
-        i += 1;
-        if n >= 0 {
-            let k = n as usize + 1;
-            let s = src.get(i..i + k).ok_or(Error::Truncated)?;
-            out.extend_from_slice(s);
-            i += k;
-        } else if n != -128 {
-            let k = (1 - n as isize) as usize;
-            let v = *src.get(i).ok_or(Error::Truncated)?;
-            out.extend(std::iter::repeat_n(v, k));
-            i += 1;
-        }
-    }
-    out.resize(start + row, 0);
-    Ok(())
-}
-
-/// PackBits encoding of one row.
-pub(crate) fn pack_bits(src: &[u8]) -> Vec<u8> {
-    let mut out = vec![];
-    let mut i = 0;
-    while i < src.len() {
-        // run of identical bytes
-        let mut run = 1;
-        while i + run < src.len() && src[i + run] == src[i] && run < 128 {
-            run += 1;
-        }
-        if run >= 2 {
-            out.push((1 - run as isize) as i8 as u8);
-            out.push(src[i]);
-            i += run;
-            continue;
-        }
-        // literal run
-        let start = i;
-        let mut n = 0;
-        while i < src.len() && n < 128 {
-            if i + 1 < src.len() && src[i + 1] == src[i] {
-                break;
-            }
-            i += 1;
-            n += 1;
-        }
-        if n == 0 {
-            i += 1;
-            n = 1;
-        }
-        out.push((n - 1) as u8);
-        out.extend_from_slice(&src[start..start + n]);
-    }
-    out
+    // The production caller already charges/reserves the complete plane in Budget.
+    // Keep the shared recovery API bounded to this row; never relax the app budget.
+    craft_psd::compression::packbits::decode_padded_into(src, row, row, out).map_err(|error| match error {
+        craft_psd::PsdError::Decompress(_) => Error::Truncated,
+        other => Error::Invalid(other.to_string()),
+    })
 }
 
 pub(crate) fn srgb_encode(v: f32) -> f32 {

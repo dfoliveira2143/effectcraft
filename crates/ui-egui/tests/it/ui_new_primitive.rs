@@ -11,7 +11,10 @@ use serde_json::json;
 fn harness() -> Harness<'static, EffectcraftApp> {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Scene", "width": 640, "height": 360, "duration": 2})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.step();
     h
 }
@@ -70,7 +73,7 @@ fn choose(h: &mut Harness<'_, EffectcraftApp>, kind: PrimitiveKind) {
 }
 
 fn layers(h: &Harness<'_, EffectcraftApp>) -> Vec<Layer> {
-    h.state().session.active_comp().unwrap().layers.clone()
+    h.state().session.active_comp().unwrap().layers.to_vec()
 }
 
 fn renderer(h: &Harness<'_, EffectcraftApp>) -> Renderer {

@@ -1,3 +1,4 @@
+use crate::gpu_test::RenderSerial;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -80,13 +81,17 @@ fn browser_cache_refreshes_filters_navigates_and_recovers_from_errors() {
     }
     let mut session = Session { browser: Some(browser.clone()), ..Default::default() };
     session.prefs.general.language = "en".into();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(|_| {
-        let mut app = EffectcraftApp::new(session);
-        app.ui.start_screen = false;
-        app.show_panel(PanelKind::MediaBrowser);
-        app.ui.maximized = Some(PanelKind::MediaBrowser);
-        app
-    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_step_dt(1.0 / 60.0)
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| {
+            let mut app = EffectcraftApp::new(session);
+            app.ui.start_screen = false;
+            app.show_panel(PanelKind::MediaBrowser);
+            app.ui.maximized = Some(PanelKind::MediaBrowser);
+            app
+        });
     h.run_steps(3);
     let (time, first) = listing(&h, false);
     assert_eq!(names(&first), ["Sub", "Clip.csv", "notes.txt"]);
@@ -140,6 +145,6 @@ fn browser_cache_refreshes_filters_navigates_and_recovers_from_errors() {
     assert_eq!(names(&listing(&h, false).1), ["Sub", "Added.csv", "Clip.csv", "From action.csv"]);
     assert!(h.state().auto.find("mediaBrowser.entry.Clip.csv").is_some());
     if let Ok(path) = std::env::var("MEDIA_BROWSER_SNAPSHOT") {
-        h.render().unwrap().save(path).unwrap();
+        h.render_serialized().unwrap().save(path).unwrap();
     }
 }

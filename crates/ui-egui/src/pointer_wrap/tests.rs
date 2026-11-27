@@ -67,10 +67,7 @@ impl Scrub {
                     pos2(100.0, 100.0),
                     Id::unique("scrub"),
                     self.value,
-                    1.0,
-                    (-1e9, 1e9),
-                    1,
-                    "",
+                    &crate::widgets::HotSpec { speed: 1.0, range: (-1e9, 1e9), decimals: 1, suffix: "" },
                     &crate::theme::Tokens::for_kind(crate::theme::ThemeKind::Dark),
                 );
                 if let Some(v) = value {
@@ -291,6 +288,7 @@ fn real_properties_and_angle_drags_keep_each_gesture_in_one_undo_step() {
         app.show_panel(panel);
         app.toggle_maximize(panel);
         let ctx = Context::default();
+        crate::framework::install_headless(&ctx);
         let bounds = Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 1000.0));
         let mut frame = eframe::Frame::_new_kittest();
         let mut time = 0.0;

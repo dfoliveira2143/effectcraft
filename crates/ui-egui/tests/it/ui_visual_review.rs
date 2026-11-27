@@ -1,5 +1,6 @@
 //! Opt-in visual review of every built-in panel, workspaces and common dialogs.
 //! Original fixture; captures are review outputs, not shipped assets.
+use crate::gpu_test::RenderSerial;
 use effectcraft_engine::Session;
 use effectcraft_ui_egui::{Dialog, EffectcraftApp, dock::PanelKind};
 use egui_kittest::Harness;
@@ -17,20 +18,21 @@ fn all_ui_review_captures() {
         s.execute("layer.newSolid", json!({"name":"Plate","color":"#406080","width":160,"height":120})).unwrap();
         s.execute("renderQueue.add", json!({"format":"png","output":"review-[#####].png"})).unwrap();
         std::sync::Arc::make_mut(&mut s.project).settings.gpu_acceleration = false;
-        let mut h = Harness::builder().with_size(size).build_eframe(|_| EffectcraftApp::new(s));
+        let mut h =
+            Harness::builder().with_size(size).with_context_setup(effectcraft_ui_egui::framework::install_headless).build_eframe(|_| EffectcraftApp::new(s));
         h.run_steps(4);
-        h.render().unwrap().save(out.join(format!("{label}-workspace.png"))).unwrap();
+        h.render_serialized().unwrap().save(out.join(format!("{label}-workspace.png"))).unwrap();
         let ctx = h.ctx.clone();
         h.state_mut().set_theme(&ctx, effectcraft_ui_egui::theme::ThemeKind::Light);
         h.run_steps(4);
-        h.render().unwrap().save(out.join(format!("{label}-workspace-light.png"))).unwrap();
+        h.render_serialized().unwrap().save(out.join(format!("{label}-workspace-light.png"))).unwrap();
         h.state_mut().set_theme(&ctx, effectcraft_ui_egui::theme::ThemeKind::Dark);
         for p in PanelKind::ALL {
             h.state_mut().show_panel(p);
             h.state_mut().ui.maximized = Some(p);
             h.run_steps(4);
             assert!(h.state().auto.find(&format!("panel.{}", p.id())).is_some(), "{} opens", p.title());
-            h.render().unwrap().save(out.join(format!("{label}-{}.png", p.id()))).unwrap();
+            h.render_serialized().unwrap().save(out.join(format!("{label}-{}.png", p.id()))).unwrap();
         }
         h.state_mut().ui.maximized = None;
         for (name, dialog) in [
@@ -42,7 +44,7 @@ fn all_ui_review_captures() {
         ] {
             h.state_mut().dialog = Some(dialog);
             h.run_steps(4);
-            h.render().unwrap().save(out.join(format!("{label}-dialog-{name}.png"))).unwrap();
+            h.render_serialized().unwrap().save(out.join(format!("{label}-dialog-{name}.png"))).unwrap();
             h.state_mut().dialog = None;
             h.run_steps(2);
         }

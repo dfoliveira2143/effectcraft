@@ -1,5 +1,8 @@
 use super::create::{color_p, pixel_aspect_p};
-use super::*;
+use super::{
+    EngineError, ItemKind, KV, LayerId, LayerSource, PropGroup, Result, Session, Tick, Value, bad, has_layers, json, layer_mut, layer_p, layers_p, limits,
+    str_p, unlocked,
+};
 
 /// Move Position by `(dx, dy)`, including every key. Separated dimensions move X and Y as well
 /// as the combined property the channels were split from.
@@ -71,14 +74,39 @@ pub(super) fn transform_op(s: &mut Session, p: &Value) -> Result<Value> {
     let op = str_p(p, "op").unwrap_or("reset").to_string();
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let t = s.time();
-    let sizes: Vec<(LayerId, (u32, u32))> =
-        comp.layers.iter().filter(|l| ids.contains(&l.id)).map(|l| (l.id, effectcraft_render::source_size(&s.project, l))).collect();
+    // A shape or text layer has no source item, so source_size is (0, 0): the fit ops size it by
+    // its painted bounds at the current time instead, and anchor at the bounds' centre — content
+    // bounds live in layer space, where a shape is centred on the origin and text sits above its
+    // baseline, so (w/2, h/2) would push it off-centre (#2198). Reset and the other ops keep the
+    // source size.
+    let ectx = effectcraft_render::EvalCtx {
+        expr: s.expr.as_deref(),
+        footage: Some(s.footage.as_ref()),
+        ..effectcraft_render::EvalCtx::new(&s.project, cid, &comp, t)
+    };
+    let fitting = matches!(op.as_str(), "fit" | "fitWidth" | "fitHeight");
+    let sizes: Vec<(LayerId, [f64; 2], [f64; 2])> = comp
+        .layers
+        .iter()
+        .filter(|l| ids.contains(&l.id))
+        .map(|l| {
+            let (w, h) = effectcraft_render::source_size(&s.project, l);
+            if fitting && (w == 0 || h == 0) {
+                match effectcraft_render::content_bounds(&ectx, l).filter(|b| b.iter().all(|v| v.is_finite()) && b[2] > b[0] && b[3] > b[1]) {
+                    Some(b) => (l.id, [b[2] - b[0], b[3] - b[1]], [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0]),
+                    None => (l.id, [0.0; 2], [0.0; 2]),
+                }
+            } else {
+                (l.id, [w as f64, h as f64], [w as f64 / 2.0, h as f64 / 2.0])
+            }
+        })
+        .collect();
     s.edit("Transform", None, |proj, _| {
-        for (lid, (w, h)) in &sizes {
+        for (lid, size, anchor) in &sizes {
             let l = layer_mut(proj, cid, *lid)?;
             let lt = l.layer_time(t);
             let (cw, ch) = (comp.width as f64, comp.height as f64);
-            let (w, h) = (*w as f64, *h as f64);
+            let (w, h) = (size[0], size[1]);
             let Some(tr) = l.transform_mut() else { continue };
             let set = |tr: &mut PropGroup, m: &str, v: KV| {
                 if let Some(pr) = tr.get_mut(m) {
@@ -102,11 +130,15 @@ pub(super) fn transform_op(s: &mut Session, p: &Value) -> Result<Value> {
                         "fitHeight" => (ch / h, ch / h),
                         _ => (cw / w, ch / h),
                     };
+                    // A tiny shape's bounds can overflow the scale; refuse rather than write infinity.
+                    if !(sx * 100.0).is_finite() || !(sy * 100.0).is_finite() {
+                        return Err(EngineError::Other(format!("layer {} is too small to fit to the composition", lid.0)));
+                    }
                     let z = |m: &str, d: f64| tr.get(m).map(|p| p.value_at(lt).as_vec3()[2]).unwrap_or(d);
                     let (sz, az) = (z("scale", 100.0), z("anchor", 0.0));
                     set(tr, "scale", KV::Vec3([sx * 100.0, sy * 100.0, sz]));
                     update_position(tr, lt, |p| [cw / 2.0, ch / 2.0, p[2]]);
-                    set(tr, "anchor", KV::Vec3([w / 2.0, h / 2.0, az]));
+                    set(tr, "anchor", KV::Vec3([anchor[0], anchor[1], az]));
                 }
                 "flipH" | "flipV" => {
                     let cur = tr.get("scale").map(|p| p.value_at(lt).as_vec3()).unwrap_or([100.0; 3]);
@@ -125,7 +157,7 @@ pub(super) fn transform_op(s: &mut Session, p: &Value) -> Result<Value> {
 /// layers, which are solids) edit their Solid Settings. With `affectAll: false`, a solid other
 /// layers also use is copied into a new solid for this layer instead of being changed for all of
 /// them (After Effects' "Affect all layers that use this solid"). `name` renames the layer and
-/// its solid.
+/// its solid; an empty one makes a text layer's name follow its text again.
 pub(super) fn layer_settings(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid) = layer_p(s, p, "layer.settings")?;
     // Cameras and lights open their own settings (Camera Settings / Light Settings).
@@ -139,11 +171,18 @@ pub(super) fn layer_settings(s: &mut Session, p: &Value) -> Result<Value> {
     let h = p.get("height").and_then(Value::as_u64).map(limits::size);
     let pixel_aspect = pixel_aspect_p(p)?;
     let name = str_p(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+    // An empty name gives a text layer its text's name again, as `layer.rename` does (#3233);
+    // other layers keep theirs.
+    let follow_text = str_p(p, "name").is_some_and(|n| n.trim().is_empty());
     let affect_all = p.get("affectAll").and_then(Value::as_bool).unwrap_or(true);
+    let t = s.time();
     let solid = s.edit("Layer Settings", None, |proj, _| {
         let src = layer_mut(proj, cid, lid)?.source.clone();
         if let Some(n) = &name {
-            layer_mut(proj, cid, lid)?.name = n.clone();
+            // A user name: a text layer's name stops following its text (#3233).
+            super::switches::set_layer_name(layer_mut(proj, cid, lid)?, n, t);
+        } else if follow_text && matches!(src, LayerSource::Text) {
+            super::switches::set_layer_name(layer_mut(proj, cid, lid)?, "", t);
         }
         let LayerSource::Solid { item } = src else { return Ok(None) };
         let shared = proj.comps().flat_map(|(_, c)| &c.layers).filter(|l| l.source == src).count() > 1;

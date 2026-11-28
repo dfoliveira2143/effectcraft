@@ -61,8 +61,11 @@ fn root_comps(project: &Project) -> Vec<ItemId> {
 fn import_project(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad(C, "missing `path` (.ecproj)"))?.to_string();
     let (mut sub, saved_by) = read_project(s, &path)?;
-    crate::upgrade_effects(&mut sub);
+    // (channel selection can't be animated, as in After Effects: said with the import's warnings)
+    let lost = crate::upgrade_effects(&mut sub);
     let file = std::path::Path::new(&path);
+    // Existing freezes can have been created with the stored path or its resolved form.
+    let mut freezes = crate::roto::imported_object_matte_freezes(&sub);
     let missing = resolve_footage(s, &mut sub, &path);
     s.stored_paths.add(&sub, Some(&path));
     // The imported project's own render queue stays behind (as for templates).
@@ -70,7 +73,9 @@ fn import_project(s: &mut Session, p: &Value) -> Result<Value> {
     if sub.next_id.checked_add(base).is_none() {
         return Err(bad(C, format!("{path} has ids out of range")));
     }
+    freezes.extend(crate::roto::imported_object_matte_freezes(&sub));
     essential::offset_ids(&mut sub, base);
+    let preserved = crate::roto::rekey_imported_object_mattes(&mut sub, base, freezes, s.expr.as_deref(), s.services.as_ref(), &s.stored_paths);
     let roots: Vec<ItemId> = root_comps(&sub);
     let folder_name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Imported Project".into());
     let (folder, items) = s.edit("Import Project", None, |proj, st| {
@@ -88,6 +93,9 @@ fn import_project(s: &mut Session, p: &Value) -> Result<Value> {
         st.project_selection = vec![folder];
         Ok((folder, items))
     })?;
+    // The edit queues newly added effects. A still-valid imported freeze already has its mattes.
+    s.roto_pending
+        .retain(|&(comp, layer, uid)| !preserved.contains(&(comp, layer, uid)) || !crate::roto::imported_freeze_matches(&s.project, comp, layer, uid));
     let comps: Vec<Value> = s
         .project
         .comps()
@@ -96,6 +104,10 @@ fn import_project(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let primary = if let [one] = roots.as_slice() { Some(one.0) } else { None };
     let mut warnings = vec![];
+    if !lost.is_empty() {
+        log::warn!("channel selection is static: keyframes or expressions dropped on {}", lost.join("; "));
+        warnings.push(format!("channel selection can't be animated: kept the first value of {}", lost.join(", ")));
+    }
     if let Some(v) = saved_by.as_deref().filter(|v| effectcraft_project::is_newer_version(v, effectcraft_project::APP_VERSION)) {
         warnings.push(format!("saved by EffectCraft {v}, newer than this version ({})", effectcraft_project::APP_VERSION));
     }

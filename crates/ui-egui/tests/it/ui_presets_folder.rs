@@ -1,5 +1,6 @@
 //! Effects & Presets: copy the configured folder path through the contents menu.
 
+use crate::gpu_test::RenderSerial;
 use effectcraft_engine::Session;
 use effectcraft_ui_egui::panels::effects_presets::PresetFile;
 use effectcraft_ui_egui::{ControlRequest, EffectcraftApp, control, dock::PanelKind};
@@ -38,13 +39,17 @@ fn presets_menu_copies_the_configured_folder_without_editing_the_project() {
     let expected = expected_folder();
     for language in ["en", "ja"] {
         // The `ja` run draws Japanese menu text, which needs an installed CJK face.
-        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).allow_missing_glyphs().build_eframe(|_| {
-            let mut app = EffectcraftApp::new(Session::default());
-            app.session.prefs.general.language = language.into();
-            app.ui.start_screen = false;
-            app.show_panel(PanelKind::EffectsPresets);
-            app
-        });
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .allow_missing_glyphs()
+            .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+            .build_eframe(|_| {
+                let mut app = EffectcraftApp::new(Session::default());
+                app.session.prefs.general.language = language.into();
+                app.ui.start_screen = false;
+                app.show_panel(PanelKind::EffectsPresets);
+                app
+            });
         h.run_steps(3);
         let before = serde_json::to_value(&h.state().session.project).unwrap();
         let revision = h.state().session.revision;
@@ -52,7 +57,7 @@ fn presets_menu_copies_the_configured_folder_without_editing_the_project() {
         click(&mut h, "effects.menu");
         h.run_steps(3);
         if let Ok(path) = std::env::var("PRESETS_FOLDER_SNAPSHOT") {
-            h.render().unwrap().save(path).unwrap();
+            h.render_serialized().unwrap().save(path).unwrap();
         }
         assert_eq!(click(&mut h, "effects.copyPresetsFolderPath"), [expected.as_str()]);
         h.run_steps(2);
@@ -66,6 +71,7 @@ fn presets_menu_copies_the_configured_folder_without_editing_the_project() {
 fn presets_folder_control_command_returns_the_path_or_a_configuration_error() {
     let mut app = EffectcraftApp::new(Session::default());
     let ctx = egui::Context::default();
+    effectcraft_ui_egui::framework::install_headless(&ctx);
     let expected = expected_folder();
     let mut reply = None;
     let mut output = ctx.run_ui(Default::default(), |ui| {
@@ -121,12 +127,16 @@ fn shared_preset_rows_search_apply_and_undo_the_selected_definition() {
     session.prefs.general.language = "en".into();
     session.execute("comp.new", json!({"width": 64, "height": 36, "duration": 2})).unwrap();
     session.execute("layer.newText", json!({"text": "Cache"})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_eframe(|_| {
-        let mut app = EffectcraftApp::new(session);
-        app.ui.start_screen = false;
-        app.show_panel(PanelKind::EffectsPresets);
-        app
-    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_step_dt(1.0 / 60.0)
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| {
+            let mut app = EffectcraftApp::new(session);
+            app.ui.start_screen = false;
+            app.show_panel(PanelKind::EffectsPresets);
+            app
+        });
     h.run_steps(3);
     let shared = std::sync::Arc::new(entries);
     let now = h.ctx.input(|i| i.time);
@@ -156,7 +166,7 @@ fn shared_preset_rows_search_apply_and_undo_the_selected_definition() {
         assert_eq!(h.state().session.active_comp().unwrap().layers[0].props.prop("transform/opacity").unwrap().value.as_f64(), expected);
         assert_eq!(h.state().session.history.undo.len(), history + 1);
         if let Ok(dir) = std::env::var("PRESET_CACHE_SNAPSHOTS") {
-            h.render().unwrap().save(format!("{dir}/{name}.png")).unwrap();
+            h.render_serialized().unwrap().save(format!("{dir}/{name}.png")).unwrap();
         }
         h.state_mut().session.execute("edit.undo", json!({})).unwrap();
         h.run_steps(2);

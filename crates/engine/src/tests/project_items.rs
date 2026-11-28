@@ -40,6 +40,52 @@ fn move_into_folder_rename_label_comment_with_undo() {
     assert_eq!(s.project.item(comp).unwrap().comment, "");
 }
 
+/// #3196: `project.newFolder` with `items` (items dropped on the Project panel's New Folder
+/// button) makes the folder and moves them into it, out of the folder they were in, in one undo
+/// step. A folder can't go into a new folder made inside itself.
+#[test]
+fn new_folder_with_items_moves_them_into_it_in_one_undo_step() {
+    let mut s = Session::default();
+    let a = ItemId(s.execute("comp.new", json!({"name": "A", "width": 64, "height": 64, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+    let b = ItemId(s.execute("comp.new", json!({"name": "B", "width": 64, "height": 64, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+    let bin = ItemId(s.execute("project.newFolder", json!({"name": "Bin"})).unwrap()["item"].as_u64().unwrap());
+    s.execute("project.move", json!({"items": [b.0], "folder": bin.0})).unwrap();
+    let before = s.project.clone();
+    let undo = s.history.undo.len();
+
+    let r = s.execute("project.newFolder", json!({"items": [a.0, "B", a.0]})).unwrap();
+    let f = ItemId(r["item"].as_u64().unwrap());
+    assert_eq!(r["moved"], 2, "duplicates count once");
+    let folder = s.project.item(f).unwrap();
+    assert!(folder.is_folder());
+    assert_eq!((folder.name.as_str(), folder.parent), ("Untitled Folder", None), "the New Folder button's name and place");
+    assert_eq!(s.project.item(a).unwrap().parent, Some(f));
+    assert_eq!(s.project.item(b).unwrap().parent, Some(f), "out of the folder it was in");
+    assert_eq!(s.state.project_selection, [f], "the new folder is selected");
+    assert_eq!(s.history.undo.len(), undo + 1, "one undo step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.project, before, "one undo takes back the folder and the move");
+
+    // A folder dropped on New Folder goes into the new folder; a new folder made inside the
+    // folder that is moving into it is refused, and nothing changes.
+    let r = s.execute("project.newFolder", json!({"items": [bin.0]})).unwrap();
+    let f = ItemId(r["item"].as_u64().unwrap());
+    assert_eq!(s.project.item(bin).unwrap().parent, Some(f));
+    s.execute("edit.undo", json!({})).unwrap();
+    // Inside another folder (`parent`), and an empty list moves nothing.
+    let r = s.execute("project.newFolder", json!({"parent": bin.0, "items": [a.0]})).unwrap();
+    let f = ItemId(r["item"].as_u64().unwrap());
+    assert_eq!((s.project.item(f).unwrap().parent, s.project.item(a).unwrap().parent), (Some(bin), Some(f)));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.execute("project.newFolder", json!({"items": []})).unwrap()["moved"], 0);
+    s.execute("edit.undo", json!({})).unwrap();
+    let before = s.project.clone();
+    assert!(s.execute("project.newFolder", json!({"parent": bin.0, "items": [bin.0]})).is_err());
+    assert!(s.execute("project.newFolder", json!({"items": [999_999]})).is_err(), "an unknown item");
+    assert!(s.execute("project.newFolder", json!({"items": a.0})).is_err(), "not an array");
+    assert_eq!(s.project, before);
+}
+
 #[test]
 fn delete_and_duplicate_items() {
     let mut s = Session::default();
@@ -210,4 +256,52 @@ fn used_in_counts_layers_across_comps() {
     assert_eq!((r["item"].as_u64(), r["count"].as_u64()), (Some(outer.0), Some(0)));
     assert_eq!(r["comps"], json!([]));
     assert!(s.execute("project.usedIn", json!({"item": "Nope"})).is_err());
+}
+
+/// #4097: stored and animated layer pickers follow their targets into the copied comp.
+#[test]
+fn duplicated_comp_keeps_its_layer_property_targets() {
+    use effectcraft_keyframe::{Keyframe, Value};
+    use effectcraft_time::Tick;
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Rig", "width": 64, "height": 64, "duration": 2})).unwrap();
+    let original = s.active_comp_id().unwrap();
+    let target = s.execute("layer.newNull", json!({"name": "Target"})).unwrap()["layer"].as_u64().unwrap();
+    let holder = s.execute("layer.newNull", json!({"name": "Holder"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("effect.apply", json!({"layers": [holder], "effect": "Set Matte"})).unwrap();
+    for stored in [Value::Layer(Some(target)), Value::Layer(Some(effectcraft_project::NO_LAYER)), Value::Layer(None)] {
+        let mut configured = 0;
+        std::sync::Arc::make_mut(&mut s.project).comp_mut(original).unwrap().layer_mut(LayerId(holder)).unwrap().props.walk_mut(&mut |p| {
+            if matches!(p.value, Value::Layer(_)) {
+                p.value = stored.clone();
+                p.keys = vec![
+                    Keyframe::new(Tick::ZERO, Value::Layer(Some(target))),
+                    Keyframe::new(Tick::from_seconds_f64(1.0), Value::Layer(None)),
+                    Keyframe::new(Tick::from_seconds_f64(1.5), Value::Layer(Some(effectcraft_project::NO_LAYER))),
+                ];
+                configured += 1;
+            }
+        });
+        assert!(configured > 0);
+        let before = s.project.clone();
+        let copy = ItemId(s.execute("project.duplicate", json!({"items": [original.0]})).unwrap()["items"][0].as_u64().unwrap());
+        let comp = s.project.comp(copy).unwrap();
+        let copied_target = comp.layers.iter().find(|l| l.name == "Target").unwrap().id;
+        assert_ne!(copied_target.0, target);
+        let copied_holder = comp.layers.iter().find(|l| l.name == "Holder").unwrap();
+        let mut checked = 0;
+        copied_holder.props.walk("", &mut |_, p| {
+            if matches!(p.value, Value::Layer(_)) {
+                assert_eq!(p.value, if stored == Value::Layer(Some(target)) { Value::Layer(Some(copied_target.0)) } else { stored.clone() });
+                assert_eq!(p.keys[0].value, Value::Layer(Some(copied_target.0)));
+                assert_eq!(p.keys[1].value, Value::Layer(None));
+                assert_eq!(p.keys[2].value, Value::Layer(Some(effectcraft_project::NO_LAYER)));
+                checked += 1;
+            }
+        });
+        assert_eq!(checked, configured);
+        assert_eq!(s.project.comp(original), before.comp(original));
+        s.undo();
+        assert_eq!(s.project, before);
+    }
 }

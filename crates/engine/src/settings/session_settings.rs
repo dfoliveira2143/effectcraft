@@ -30,6 +30,7 @@ impl Session {
         self.apply_cache_budgets();
         self.configure_disk_cache();
         self.footage.set_conform_folder(self.conformed_audio_folder());
+        self.footage.set_localizer(self.localize_settings());
         // Switches Affect Nested Comps changes what precomp layers render: drop cached pixels.
         let nested = self.prefs.general.switches_affect_nested_comps;
         if self.applied_nested_switches.replace(nested).is_some_and(|was| was != nested) {
@@ -65,28 +66,116 @@ impl Session {
         self.cache_folder(&self.prefs.disk.media_cache_folder, "Media Cache")
     }
 
+    /// Settings ▸ Disk ▸ Localize Network Footage (#3271): the local copies' folder and size
+    /// limit, `None` when off (or there is no folder for them).
+    pub fn localize_settings(&self) -> Option<effectcraft_render::LocalizeConfig> {
+        let d = &self.prefs.disk;
+        if !d.localize_footage || cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        // Without a folder of their own, the copies go beside the disk cache's folder (a disk
+        // the user chose for caches), else beside the platform cache folder.
+        let folder = if d.localize_folder.trim().is_empty() && !d.disk_cache_folder.trim().is_empty() {
+            let dc = std::path::PathBuf::from(d.disk_cache_folder.trim());
+            dc.parent().map_or_else(|| dc.join("Local Footage Copies"), |p| p.join("Local Footage Copies"))
+        } else {
+            self.cache_folder(&d.localize_folder, "Local Footage Copies")?
+        };
+        let space_of = folder.clone();
+        Some(effectcraft_render::LocalizeConfig {
+            folder,
+            max_bytes: u64::from(d.localize_max_gb.max(1)) << 30,
+            network: network_locations(&d.network_footage_locations),
+            disk_space: Some(std::sync::Arc::new(move || {
+                // (the folder may not exist yet: its nearest existing parent's disk)
+                let mut at = space_of.as_path();
+                while !at.exists() {
+                    at = at.parent()?;
+                }
+                crate::sysinfo::disk_space(at)
+            })),
+        })
+    }
+
+    /// What the footage localizer is doing, for Settings ▸ Disk (`None`: off).
+    pub fn localize_status(&self) -> Option<effectcraft_render::LocalizeReport> {
+        self.footage.localize_status()
+    }
+
     /// Settings ▸ Disk ▸ Conformed Audio Folder (decoded footage audio, see
     /// `MediaPool::set_conform_folder`).
     pub fn conformed_audio_folder(&self) -> Option<std::path::PathBuf> {
         self.cache_folder(&self.prefs.disk.conformed_media_folder, "Conformed Audio")
     }
 
-    /// Apply the Memory & CPU cache budgets, limited by RAM Reserved for Other Applications and
-    /// reduced while the system is low on memory (see [`crate::prefs::Prefs::cache_budgets`]).
+    /// Apply the Memory & CPU budget ([`Session::memory_budget`]): one budget the big caches share
+    /// (the layer cache, the footage frames and decoded planes, the preview frames), kept by the
+    /// memory accountant, which frees the least valuable data first whichever cache holds it. No
+    /// cache has a limit of its own below that budget, except the browser's caps
+    /// ([`crate::prefs::MemoryBudget::caps`]; frontends apply the preview frames' cap) and a
+    /// headless session's footage cap ([`Session::footage_cap`]).
     pub fn apply_cache_budgets(&mut self) {
-        let b = self.prefs.cache_budgets(self.sys_memory);
-        self.layer_cache.set_budget(b.layer);
-        self.footage.set_cache_budget(b.media);
+        let b = self.memory_budget();
+        let caps = b.caps(cfg!(target_arch = "wasm32"));
+        self.layer_cache.set_budget(caps.layer);
+        self.footage.set_cache_budget(self.footage_cap.map_or(caps.footage, |cap| cap.min(caps.footage)));
+        let accountant = effectcraft_render::memory::Accountant::global();
+        let layers: std::sync::Arc<dyn effectcraft_render::memory::MemoryHolder> = self.layer_cache.clone();
+        accountant.register(&layers);
+        accountant.set_budget(b.bytes);
+        // (what one file's decoded planes may take follows it once the RAM is read, at least the
+        // fixed limit; until then the host's reader asks when a request is over that, #3749)
+        if b.installed.is_some() {
+            effectcraft_render::memory::set_decode_limit(Some(b.bytes));
+        }
+        // The process's measured memory as well (#3301: memory nobody accounts for, such as GPU
+        // staging, effect buffers and the allocator's fragmentation): over the purge limit the
+        // caches give way by what it is over, over the hard limit also the frames a playing
+        // preview shows next.
+        if let Some((purge_at, hard_at)) = self.prefs.process_limits(self.sys_memory) {
+            accountant.set_process_memory(crate::sysinfo::process_memory, purge_at, hard_at);
+        }
+    }
+
+    /// What each of an export's two layer caches (one per compositor) may hold (#3941): the
+    /// session's layer cache budget. On the desktop that is the whole common budget, and both are
+    /// in the memory accountant, which keeps them within it together with the session's caches.
+    /// In the browser each gets half the layer cache's cap, so the two together keep it.
+    pub fn export_cache_budget(&self) -> usize {
+        let web = cfg!(target_arch = "wasm32");
+        let layer = self.memory_budget().caps(web).layer;
+        if web { layer / 2 } else { layer }
+    }
+
+    /// The memory the caches share for the last memory reading ([`Prefs::memory_budget`]), kept
+    /// reduced through a low-memory episode until the system has recovered
+    /// ([`crate::sysinfo::SysMemory::still_low`]), so the budget (and the toast) doesn't flip
+    /// with every reading.
+    pub fn memory_budget(&self) -> crate::prefs::MemoryBudget {
+        let low = self.sys_memory.is_some_and(|m| m.still_low(self.memory_low));
+        self.prefs.memory_budget(self.sys_memory, low)
     }
 
     /// Take the latest reading of the system's memory and start the next one in the background
     /// (desktop frontends call this every few seconds; it never waits for the system), then
-    /// re-apply the cache budgets when the reading changes them. Returns the effective budgets.
-    pub fn memory_tick(&mut self) -> crate::prefs::CacheBudgets {
-        let before = self.prefs.cache_budgets(self.sys_memory);
-        self.sys_memory = self.memory_watch.latest().or(self.sys_memory);
+    /// re-apply the memory budget when the reading changes it. Returns the budget in effect.
+    /// The disk cache's free disk space is read the same way (it keeps a reserve free).
+    pub fn memory_tick(&mut self) -> crate::prefs::MemoryBudget {
+        self.poll_disk_space();
+        let reading = self.memory_watch.latest();
         self.memory_watch.poll();
-        let after = self.prefs.cache_budgets(self.sys_memory);
+        self.take_memory_reading(reading)
+    }
+
+    /// [`Session::memory_tick`] with the memory reading taken (`None`: no new one).
+    pub fn take_memory_reading(&mut self, reading: Option<crate::sysinfo::SysMemory>) -> crate::prefs::MemoryBudget {
+        let before = self.memory_budget();
+        self.sys_memory = reading.or(self.sys_memory);
+        self.memory_low = self.sys_memory.is_some_and(|m| m.still_low(self.memory_low));
+        let after = self.memory_budget();
+        // (the process's memory is checked with each balance; a reading now and then also
+        // when the caches don't grow)
+        effectcraft_render::memory::Accountant::global().balance();
         if after != before {
             self.apply_cache_budgets();
             // Frontends re-apply their preview cache budget.
@@ -96,6 +185,19 @@ impl Session {
             }
         }
         after
+    }
+
+    /// Read the disk cache's free disk space in the background and apply it there (the reserve
+    /// it keeps free): the free space and the cache's size are taken at the same moment, and the
+    /// reader holds its own cache, so a reading never reaches another folder's.
+    fn poll_disk_space(&mut self) {
+        if let Some(dc) = &self.disk_cache {
+            let dc = dc.clone();
+            self.disk_watch.poll_with("ec-disk-space", move || {
+                dc.set_disk_space(crate::sysinfo::disk_space(dc.folder()));
+                Some(())
+            });
+        }
     }
 
     /// Apply Settings ▸ Media & Disk Cache ▸ Disk Cache: open (or close) the persistent cache
@@ -113,7 +215,9 @@ impl Session {
         // (no file system in the browser: the disk cache stays off there)
         let Some(folder) = folder.filter(|_| d.disk_cache_enabled && !cfg!(target_arch = "wasm32")) else {
             self.disk_cache = None;
+            self.disk_watch = Default::default();
             self.layer_cache.set_disk(None);
+            self.footage.set_disk_cache(None);
             return;
         };
         // Tests: the Roto/Object Matte segment store below is one per process, so a test that
@@ -126,19 +230,39 @@ impl Session {
                 c.set_max_bytes(max);
                 c.clone()
             }
+            // A new folder: the free-space reading was for the old one (a reader still running
+            // holds the old watcher's state, so it can't write into the new one).
             _ => match DiskCache::open(&folder, max) {
-                Ok(c) => c,
+                Ok(c) => {
+                    self.disk_watch = Default::default();
+                    c
+                }
                 Err(e) => {
                     log::warn!("disk cache at {}: {e}", folder.display());
                     self.disk_cache = None;
+                    self.disk_watch = Default::default();
                     self.layer_cache.set_disk(None);
+                    self.footage.set_disk_cache(None);
                     return;
                 }
             },
         };
+        // Files reloaded while the cache was off: their entries go before anything is read from
+        // it (until the writer has deleted them they are misses, and no frame is linked).
+        if !self.pending_disk_drops.is_empty() {
+            dc.drop_files(std::mem::take(&mut self.pending_disk_drops));
+        }
         self.disk_cache = Some(dc.clone());
-        let salt = self.refresh_disk_salt(true).unwrap_or_default();
-        self.layer_cache.set_disk(Some((dc.clone(), salt)));
+        // The reserve applies from the start (a new folder's watcher is idle).
+        self.poll_disk_space();
+        // Used at once (no file is looked at first: each entry checks the source files it lists
+        // when it is read, #3184).
+        self.layer_cache.set_disk(Some(dc.clone()));
+        // Decoded footage channels (OpenEXR planes) persist there too (#3271).
+        self.footage.set_disk_cache(Some(dc.clone()));
+        // Its write queue counts in the common memory budget.
+        let queue: std::sync::Arc<dyn effectcraft_render::memory::MemoryHolder> = dc.clone();
+        effectcraft_render::memory::Accountant::global().register(&queue);
         // Roto Brush / Object Matte segmentations persist there too (held weakly: switching the
         // disk cache off drops it).
         let store: std::sync::Arc<dyn effectcraft_effects::roto::SegStore> = dc.clone();
@@ -171,9 +295,19 @@ impl Session {
         self.shortcut_table = std::sync::OnceLock::new();
     }
 
-    /// The active shortcut preset resolved against every bindable command.
+    /// The scripts in the Scripts folder changed: list File ▸ Scripts' entries again in the
+    /// shortcut table.
+    pub fn scripts_changed(&mut self) {
+        self.shortcut_table = std::sync::OnceLock::new();
+    }
+
+    /// The active shortcut preset resolved against every bindable command, File ▸ Scripts'
+    /// entries included.
     pub fn shortcuts(&self) -> &ShortcutTable {
-        self.shortcut_table.get_or_init(|| ShortcutTable::build(&self.keymaps, &self.ui_commands))
+        self.shortcut_table.get_or_init(|| {
+            let scripts: Vec<String> = crate::commands::scripts::scripts(self).into_iter().filter(|e| !e.panel).map(|e| e.name).collect();
+            ShortcutTable::build_with_scripts(&self.keymaps, &self.ui_commands, &scripts)
+        })
     }
 
     /// Remember a project in File ▸ Open Recent and in the crash-recovery sentinel.
@@ -332,4 +466,10 @@ impl Session {
             self.autosave.sentinel = false;
         }
     }
+}
+
+/// Settings ▸ Disk ▸ Network Footage Locations: path prefixes separated by `;` or new lines
+/// (`P:\; Q:\renders`), each counted as network footage (#3271).
+pub fn network_locations(setting: &str) -> Vec<std::path::PathBuf> {
+    setting.split([';', '\n']).map(str::trim).filter(|s| !s.is_empty()).map(std::path::PathBuf::from).collect()
 }

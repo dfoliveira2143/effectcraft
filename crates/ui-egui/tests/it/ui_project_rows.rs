@@ -20,7 +20,10 @@ fn harness() -> (Harness<'static, EffectcraftApp>, ItemId, ItemId, ItemId) {
     s.execute("project.move", json!({"items": [comp.0], "folder": folder.0})).unwrap();
     s.execute("project.move", json!({"items": [solid.0], "folder": null})).unwrap();
     s.execute("project.select", json!({"items": []})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1600.0, 1000.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| EffectcraftApp::new(s));
     h.run_steps(3);
     (h, folder, comp, solid)
 }
@@ -234,7 +237,10 @@ fn dragging_in_the_empty_area_box_selects_items() {
 #[test]
 fn a_short_project_panel_draws() {
     for height in [400.0, 300.0] {
-        let mut h = Harness::builder().with_size(egui::vec2(640.0, height)).build_eframe(|_| EffectcraftApp::new(Session::default()));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(640.0, height))
+            .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+            .build_eframe(|_| EffectcraftApp::new(Session::default()));
         h.run_steps(3);
         assert!(h.state().auto.find("project.empty").is_some(), "the Project panel drew at {height} points");
     }
@@ -274,12 +280,13 @@ fn comp_context_menu_opens_that_comps_settings() {
     assert_eq!(h.state().dialog, Some(Dialog::CompSettings));
     assert_eq!(h.state().session.active_comp_id(), Some(main), "the viewer keeps its comp");
     // A new name, then OK: Side's own size goes back to Side under it. Main's values in the
-    // dialog, or OK writing to the viewer's comp, would resize or rename the wrong one.
+    // dialog, or OK writing to the viewer's comp, would resize or rename the wrong one. The
+    // dialog previews the name as it is typed; OK keeps that as one undo step.
+    let undo = h.state().session.history.undo.len();
     click(&mut h, "dialog.comp.name");
     h.input_mut().events.push(Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND });
     h.input_mut().events.push(Event::Text("Side 2".into()));
     h.run_steps(2);
-    let undo = h.state().session.history.undo.len();
     h.input_mut().events.push(Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
     h.run_steps(2);
     assert_eq!(h.state().dialog, None, "OK closed the dialog");
